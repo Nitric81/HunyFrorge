@@ -1,0 +1,36 @@
+# Local dependencies and generated web output
+node_modules/
+dist/
+*.tsbuildinfo
+__pycache__/
+*.py[cod]
+
+# Local configuration and runtime data
+.env
+.env.local
+data/
+*.log
+
+# Local agent/editor state
+.agents/
+.playwright-mcp/
+.tidyfactor/
+
+# Generated diagnostics and ad-hoc model outputs
+*.glb
+*.zip
+preview_resp.json
+veh_img.txt
+mesh-shape.png
+wheel-partition*.png
+rigged-vehicle-check.png
+
+# Unity generated state; retain the reproducible project sources.
+unity-smoke-test/Library/
+unity-smoke-test/Logs/
+unity-smoke-test/UserSettings/
+unity-smoke-test/smoke-test.log
+unity-smoke-test/smoke-test-report.json
+
+# The Unity smoke-test project is local verification material, not application source.
+unity-smoke-test/

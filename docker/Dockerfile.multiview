@@ -1,0 +1,15 @@
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HUNYUAN2MV_MODEL_PATH=/models/Hunyuan3D-2mv HUNYUAN2MV_SUBFOLDER=hunyuan3d-dit-v2-mv-turbo \
+    HUNYUAN2MV_FLASHVDM=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1 \
+    PYTHONPATH=/opt/hunyuan2
+
+RUN apt-get update && apt-get install -y --no-install-recommends python3.10 python3-pip git git-lfs libgl1 libglib2.0-0 libegl1-mesa-dev build-essential cmake ninja-build && rm -rf /var/lib/apt/lists/*
+ARG HUNYUAN2MV_SOURCE_REVISION=f8db63096c8282cb27354314d896feba5ba6ff8a
+RUN git init /opt/hunyuan2 && git -C /opt/hunyuan2 remote add origin https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git && git -C /opt/hunyuan2 fetch --depth 1 origin ${HUNYUAN2MV_SOURCE_REVISION} && git -C /opt/hunyuan2 checkout --detach FETCH_HEAD
+RUN python3.10 -m pip install --upgrade pip setuptools wheel && python3.10 -m pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124 && python3.10 -m pip install -r /opt/hunyuan2/requirements.txt && python3.10 -m pip install fastapi uvicorn
+WORKDIR /app
+COPY docker/multiview_worker.py /app/multiview_worker.py
+EXPOSE 8083
+CMD ["python3.10", "-m", "uvicorn", "multiview_worker:app", "--host", "0.0.0.0", "--port", "8083"]

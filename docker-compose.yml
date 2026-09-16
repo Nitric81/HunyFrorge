@@ -1,0 +1,70 @@
+services:
+  hunyforge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hunyforge
+    ports:
+      - "127.0.0.1:8081:8081"
+    environment:
+      HUNYFORGE_DEMO: "${HUNYFORGE_DEMO:-0}"
+      HUNYFORGE_DATA_ROOT: /data
+      HUNYUAN_ROOT: /opt/hunyuan
+      HUNYUAN_MODEL_PATH: /models/Hunyuan3D-2.1
+      HUNYUAN_API_URL: http://127.0.0.1:8082
+      HUNYUAN_REQUEST_TIMEOUT_SECONDS: "3600"
+      HUNYUAN_RENDER_SIZE: "1024"
+      HUNYUAN_TEXTURE_SIZE: "2048"
+      HUNYUAN_DINO_DEVICE: "${HUNYUAN_DINO_DEVICE:-cuda}"
+      HUNYUAN_FLASHVDM: "${HUNYUAN_FLASHVDM:-1}"
+      HUNYUAN_COMPILE: "${HUNYUAN_COMPILE:-0}"
+      HUNYUAN_CPU_THREADS: "${HUNYUAN_CPU_THREADS:-8}"
+      HUNYFORGE_MULTI_VIEW_URL: "${HUNYFORGE_MULTI_VIEW_URL:-http://hunyforge-multiview:8083}"
+      HUNYFORGE_T2I_MODEL_PATH: "${HUNYFORGE_T2I_MODEL_PATH:-/models/FLUX.2-klein-4B}"
+      HUNYFORGE_T2I_ENABLED: "${HUNYFORGE_T2I_ENABLED:-1}"
+      HUNYFORGE_T2I_MAX_PROMPT_CHARS: "${HUNYFORGE_T2I_MAX_PROMPT_CHARS:-2000}"
+      HUNYUAN_MODEL_REVISION: "${HUNYUAN_MODEL_REVISION:-0b94677654c57bb9a6b6845cd7b704ccf551d327}"
+      HUNYUAN_SOURCE_REVISION: "${HUNYUAN_SOURCE_REVISION:-82920d643c0dc2f7bfd7255f45f62d386edfe60c}"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    volumes:
+      - hunyforge-data:/data
+      - "${HUNYUAN_MODEL_HOST_PATH:-D:/AI_Models/Hunyuan3D-2.1}:/models/Hunyuan3D-2.1:ro"
+      - "${HUNYFORGE_T2I_MODEL_HOST_PATH:-D:/AI_Models/FLUX.2-klein-4B}:/models/FLUX.2-klein-4B:ro"
+      - "${HUNYFORGE_HF_CACHE_HOST_PATH:-D:/AI_Models/HunyForge-cache/huggingface}:/root/.cache/huggingface"
+      - "${HUNYFORGE_U2NET_CACHE_HOST_PATH:-D:/AI_Models/HunyForge-cache/u2net}:/root/.u2net"
+    healthcheck:
+      test:
+        - CMD
+        - python3.10
+        - -c
+        - "import json,urllib.request;d=json.load(urllib.request.urlopen('http://127.0.0.1:8081/health',timeout=4));assert d.get('runtime_ready'),'runtime not ready'"
+      interval: 15s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    gpus: all
+    restart: unless-stopped
+
+  hunyforge-multiview:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.multiview
+    profiles: ["multiview"]
+    environment:
+      HUNYUAN2MV_MODEL_PATH: /models/Hunyuan3D-2mv
+      HUNYUAN2MV_SUBFOLDER: "${HUNYUAN2MV_SUBFOLDER:-hunyuan3d-dit-v2-mv-turbo}"
+      HUNYUAN2MV_FLASHVDM: "${HUNYUAN2MV_FLASHVDM:-1}"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    volumes:
+      - "${HUNYUAN2MV_MODEL_HOST_PATH:-D:/AI_Models/Hunyuan3D-2mv}:/models/Hunyuan3D-2mv:ro"
+      - "${HUNYFORGE_HF_CACHE_HOST_PATH:-D:/AI_Models/HunyForge-cache/huggingface}:/root/.cache/huggingface"
+      - "${HUNYFORGE_U2NET_CACHE_HOST_PATH:-D:/AI_Models/HunyForge-cache/u2net}:/root/.u2net"
+    gpus: all
+    restart: unless-stopped
+
+volumes:
+  hunyforge-data:

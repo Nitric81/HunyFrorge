@@ -1,0 +1,1 @@
+"""HunyForge local inference service."""

@@ -1,0 +1,9 @@
+{
+  "name": "hunyforge",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": { "dev": "vite", "build": "tsc -b && vite build", "test": "vitest run --passWithNoTests", "lint": "tsc --noEmit" },
+  "dependencies": { "@vitejs/plugin-react": "latest", "vite": "latest", "typescript": "latest", "react": "latest", "react-dom": "latest", "lucide-react": "latest", "three": "latest" },
+  "devDependencies": { "vitest": "latest", "jsdom": "latest", "@types/react": "latest", "@types/react-dom": "latest", "@types/three": "latest" }
+}

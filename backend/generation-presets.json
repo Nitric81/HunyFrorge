@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "default": "standard",
+  "presets": {
+    "draft": {
+      "label": "Draft",
+      "description": "Preview geometry and lower-resolution textures; measured on RTX 4080 with CUDA DINO + FlashVDM.",
+      "quality_status": "measured-performance; quality provisional",
+      "expected_duration_seconds": 182,
+      "expected_peak_vram_mb": 8945,
+      "settings": {
+        "num_inference_steps": 10,
+        "guidance_scale": 5.0,
+        "octree_resolution": 256,
+        "num_chunks": 8000,
+        "remove_background": true,
+        "render_size": 512,
+        "texture_size": 1024,
+        "max_num_view": 4,
+        "texture_inference_steps": 10,
+        "texture_guidance_scale": 3.0,
+        "multiview_resolution": 512,
+        "face_count": 20000,
+        "generate_lods": false,
+        "generate_collision": false,
+        "collision_mode": "box",
+        "unity_mode": "fast"
+      }
+    },
+    "standard": {
+      "label": "Standard",
+      "description": "Balanced geometry with 1K textures; measured on RTX 4080 with CUDA DINO + FlashVDM.",
+      "quality_status": "measured-performance; quality provisional",
+      "expected_duration_seconds": 177,
+      "expected_peak_vram_mb": 8940,
+      "settings": {
+        "num_inference_steps": 30,
+        "guidance_scale": 5.0,
+        "octree_resolution": 384,
+        "num_chunks": 8000,
+        "remove_background": true,
+        "render_size": 768,
+        "texture_size": 1024,
+        "max_num_view": 4,
+        "texture_inference_steps": 15,
+        "texture_guidance_scale": 3.0,
+        "multiview_resolution": 512,
+        "face_count": 40000,
+        "generate_lods": true,
+        "generate_collision": true,
+        "collision_mode": "box",
+        "unity_mode": "fast"
+      }
+    },
+    "final": {
+      "label": "Final",
+      "description": "Reference 1024 render / 2048 texture, six views, UniPC 15. Measured on RTX 4080 with CUDA DINO + FlashVDM.",
+      "quality_status": "measured-performance; quality provisional",
+      "expected_duration_seconds": 251,
+      "expected_peak_vram_mb": 11149,
+      "settings": {
+        "num_inference_steps": 50,
+        "guidance_scale": 5.0,
+        "octree_resolution": 384,
+        "num_chunks": 8000,
+        "remove_background": true,
+        "render_size": 1024,
+        "texture_size": 2048,
+        "max_num_view": 6,
+        "texture_inference_steps": 15,
+        "texture_guidance_scale": 3.0,
+        "multiview_resolution": 512,
+        "face_count": 40000,
+        "generate_lods": true,
+        "generate_collision": true,
+        "collision_mode": "convex_hull",
+        "unity_mode": "full"
+      }
+    }
+  }
+}

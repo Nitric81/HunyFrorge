@@ -1,0 +1,122 @@
+diff --git a/hy3dpaint/textureGenPipeline.py b/hy3dpaint/textureGenPipeline.py
+--- a/hy3dpaint/textureGenPipeline.py
++++ b/hy3dpaint/textureGenPipeline.py
+@@ -34,8 +34,9 @@ class Hunyuan3DPaintConfig:
+ 
+         self.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
+         self.custom_pipeline = "hunyuanpaintpbr"
+-        self.multiview_pretrained_path = "tencent/Hunyuan3D-2.1"
+-        self.dino_ckpt_path = "facebook/dinov2-giant"
++        self.multiview_pretrained_path = os.environ.get("HUNYUAN_MODEL_PATH", "tencent/Hunyuan3D-2.1")
++        self.dino_ckpt_path = os.environ.get("HUNYUAN_DINO_PATH", "facebook/dinov2-giant")
++        self.dino_device = os.environ.get("HUNYUAN_DINO_DEVICE", "cpu")
+         self.realesrgan_ckpt_path = "ckpt/RealESRGAN_x4plus.pth"
+ 
+         self.raster_mode = "cr"
+@@ -49,2 +50,2 @@ class Hunyuan3DPaintConfig:
+-        self.render_size = 1024 * 2
+-        self.texture_size = 1024 * 4
++        self.render_size = int(os.environ.get("HUNYUAN_RENDER_SIZE", "1024"))
++        self.texture_size = int(os.environ.get("HUNYUAN_TEXTURE_SIZE", "2048"))
+diff --git a/hy3dpaint/utils/multiview_utils.py b/hy3dpaint/utils/multiview_utils.py
+--- a/hy3dpaint/utils/multiview_utils.py
++++ b/hy3dpaint/utils/multiview_utils.py
+@@ -34,12 +34,17 @@ class multiviewDiffusionNet:
+         self.cfg = cfg
+         self.mode = self.cfg.model.params.stable_diffusion_config.custom_pipeline[2:]
+ 
+-        model_path = huggingface_hub.snapshot_download(
+-            repo_id=config.multiview_pretrained_path,
+-            allow_patterns=["hunyuan3d-paintpbr-v2-1/*"],
+-        )
+-
+-        model_path = os.path.join(model_path, "hunyuan3d-paintpbr-v2-1")
++        if os.path.isdir(config.multiview_pretrained_path):
++            model_path = os.path.join(
++                config.multiview_pretrained_path,
++                "hunyuan3d-paintpbr-v2-1",
++            )
++        else:
++            model_path = huggingface_hub.snapshot_download(
++                repo_id=config.multiview_pretrained_path,
++                allow_patterns=["hunyuan3d-paintpbr-v2-1/*"],
++            )
++            model_path = os.path.join(model_path, "hunyuan3d-paintpbr-v2-1")
+         pipeline = DiffusionPipeline.from_pretrained(
+             model_path,
+             custom_pipeline=custom_pipeline, 
+@@ -55,7 +55,8 @@ class multiviewDiffusionNet:
+         if hasattr(self.pipeline.unet, "use_dino") and self.pipeline.unet.use_dino:
+             from hunyuanpaintpbr.unet.modules import Dino_v2
+             self.dino_v2 = Dino_v2(config.dino_ckpt_path).to(torch.float16)
+-            self.dino_v2 = self.dino_v2.to(self.device)
++            # Keep DINO on CPU because the full PBR pipeline nearly fills a 16 GB GPU.
++            self.dino_v2 = self.dino_v2.to(config.dino_device)
+ 
+     def seed_everything(self, seed):
+         random.seed(seed)
+@@ -99,5 +99,6 @@ class multiviewDiffusionNet:
+ 
+         if hasattr(self.pipeline.unet, "use_dino") and self.pipeline.unet.use_dino:
+-            dino_hidden_states = self.dino_v2(input_images[0])
++            dino_input = input_images[0].cpu() if torch.is_tensor(input_images[0]) else input_images[0]
++            dino_hidden_states = self.dino_v2(dino_input).to(self.pipeline.device)
+             kwargs["dino_hidden_states"] = dino_hidden_states
+ 
+diff --git a/model_worker.py b/model_worker.py
+--- a/model_worker.py
++++ b/model_worker.py
+@@ -169,15 +169,38 @@ class ModelWorker:
+-        # Generate mesh 
+-        try:
+-            mesh = self.pipeline(image=image)[0]
+-            logger.info("---Shape generation takes %s seconds ---" % (time.time() - start_time))
+-        except Exception as e:
+-            logger.error(f"Shape generation failed: {e}")
+-            raise ValueError(f"Failed to generate 3D mesh: {str(e)}")
+-
+-        # Export initial mesh without texture
+-        
+-        initial_save_path = os.path.join(self.save_dir, f'{str(uid)}_initial.glb')
+-        mesh.export(initial_save_path)
+-        
+-        # Generate textured mesh as obj ( as in demo )
+-        try:
++        # Reuse HunyForge's shape checkpoint during the separate texture stage.
++        if params.get("texture", False) and params.get("mesh"):
++            try:
++                mesh = trimesh.load(
++                    BytesIO(base64.b64decode(params["mesh"])),
++                    file_type="glb",
++                    force="scene",
++                )
++                if isinstance(mesh, trimesh.Scene):
++                    geometries = tuple(mesh.geometry.values())
++                    if not geometries:
++                        raise ValueError("Supplied mesh contains no geometry")
++                    mesh = trimesh.util.concatenate(geometries)
++                logger.info("Using supplied mesh for texture generation")
++            except Exception as e:
++                logger.error(f"Supplied mesh load failed: {e}")
++                raise ValueError(f"Failed to load supplied mesh: {str(e)}")
++        else:
++            try:
++                mesh = self.pipeline(image=image)[0]
++                logger.info("---Shape generation takes %s seconds ---" % (time.time() - start_time))
++            except Exception as e:
++                logger.error(f"Shape generation failed: {e}")
++                raise ValueError(f"Failed to generate 3D mesh: {str(e)}")
++
++        # Export initial mesh without texture
++        initial_save_path = os.path.join(self.save_dir, f'{str(uid)}_initial.glb')
++        mesh.export(initial_save_path)
++
++        # Generate textured mesh as obj ( as in demo )
++        # HunyForge runs PBR texturing as a separate stage to fit 16 GB VRAM.
++        # The upstream worker currently ignores params["texture"] and always
++        # enters the painter, so return the shape-only artifact explicitly.
++        if not params.get("texture", False):
++            if self.low_vram_mode:
++                torch.cuda.empty_cache()
++            return initial_save_path, uid
++        try:
