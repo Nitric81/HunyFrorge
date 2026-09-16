@@ -114,7 +114,7 @@ See [`.env.example`](.env.example) for the full supported configuration. The mod
 3. Select a quality preset. HunyForge resolves it into inference settings and records the result with the job.
 4. Generate. Shape, texture, Unity preparation, validation, and vehicle rigging progress are streamed to the UI.
 5. Inspect partial artifacts while a job runs. If a job is interrupted, use restart or resume; a child job retains its lineage and immutable source job.
-6. For vehicle assets, mark/suggest wheels in the **Rig** tab and create a rigged child job. Download the Unity package when validation passes.
+6. For vehicle assets, mark/suggest wheels in the **Rig** tab and create a rigged child job. Auto-suggest begins with four conventional wheel markers; add and place markers for additional axles (up to 16 wheels). Download the Unity package when validation passes.
 
 ## Validation and checks
 

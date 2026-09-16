@@ -66,18 +66,21 @@ def _inside_cylinder(centroids: np.ndarray, wheel: VehicleWheelSpec) -> np.ndarr
 
 
 def suggest_wheel_regions(mesh: trimesh.Trimesh) -> list[VehicleWheelSpec]:
-    """Auto-guess four wheel cylinders from bottom-region geometry.
+    """Auto-guess wheel cylinders from bottom-region geometry.
 
-    Quadrant clusters of the lowest 30% of the mesh get a two-pass cylinder fit.
-    Both candidate axle axes (X and Z) are tried per quadrant; the fit whose
-    capture is thin on exactly one axis wins. Always a suggestion — callers must
-    let the user correct the result.
+    When the generated mesh retains distinct wheel components, detect every
+    wheel component (including three-plus axle vehicles) before falling back to
+    the conventional four-quadrant fit for fused meshes. Always a suggestion —
+    callers must let the user correct the result.
     """
     verts = np.asarray(mesh.vertices)
     y_min = float(verts[:, 1].min())
     y_span = float(verts[:, 1].max() - y_min)
     if y_span <= 0:
         return []
+    component_wheels = _suggest_component_wheels(mesh, y_min, y_span)
+    if component_wheels:
+        return component_wheels
     band = verts[verts[:, 1] < y_min + 0.30 * y_span]
     if len(band) < 8:
         return []
@@ -148,6 +151,51 @@ def suggest_wheel_regions(mesh: trimesh.Trimesh) -> list[VehicleWheelSpec]:
         wheel.name = names[(wheel.center[axle_idx] < lateral_med, wheel.center[length_idx] > length_med)]
         wheel.steer = wheel.name.startswith("Wheel_F")
     return wheels
+
+
+def _suggest_component_wheels(mesh: trimesh.Trimesh, y_min: float, y_span: float) -> list[VehicleWheelSpec]:
+    """Return all detached, wheel-shaped lower mesh components when available."""
+    candidates: list[VehicleWheelSpec] = []
+    for part in mesh.split(only_watertight=False):
+        if len(part.faces) < 24:
+            continue
+        extents = np.asarray(part.extents, dtype=float)
+        horizontal = np.array([extents[0], extents[2]])
+        axle_horizontal = int(np.argmin(horizontal))
+        axle_idx = 0 if axle_horizontal == 0 else 2
+        disk_extents = np.delete(extents, axle_idx)
+        radius = float(np.mean(disk_extents) / 2.0)
+        half_width = float(extents[axle_idx] / 2.0)
+        center = np.asarray(part.centroid, dtype=float)
+        # A cylinder has two similar disk extents and one thinner axle extent.
+        # This deliberately avoids classifying chassis components as wheels.
+        if radius <= 0 or half_width > radius * 0.8 or np.ptp(disk_extents) > radius * 0.5:
+            continue
+        if center[1] > y_min + y_span * 0.55:
+            continue
+        axis = (1.0, 0.0, 0.0) if axle_idx == 0 else (0.0, 0.0, 1.0)
+        candidates.append(VehicleWheelSpec(name="candidate", center=tuple(float(v) for v in center), axis=axis, radius=radius, half_width=half_width))
+    if len(candidates) < 2:
+        return []
+
+    # Use the vehicle's dominant wheel axis to identify the forward-most axle.
+    # The rest are named deterministically without assuming a four-wheel layout.
+    primary_axis = max((wheel.axis for wheel in candidates), key=lambda axis: sum(wheel.axis == axis for wheel in candidates))
+    axle_idx = int(np.argmax(np.abs(np.asarray(primary_axis))))
+    length_idx = 2 if axle_idx == 0 else 0
+    lateral = np.median([wheel.center[axle_idx] for wheel in candidates])
+    front = max(wheel.center[length_idx] for wheel in candidates)
+    if len(candidates) == 4:
+        for wheel in candidates:
+            side = "L" if wheel.center[axle_idx] < lateral else "R"
+            end = "F" if abs(wheel.center[length_idx] - front) < 1e-4 else "R"
+            wheel.name = f"Wheel_{end}{side}"
+            wheel.steer = end == "F"
+        return candidates
+    for index, wheel in enumerate(sorted(candidates, key=lambda item: (-item.center[length_idx], item.center[axle_idx]))):
+        wheel.name = f"Wheel_{index + 1:02d}"
+        wheel.steer = abs(wheel.center[length_idx] - front) < 1e-4
+    return candidates
 
 
 def _boundary_loops(part: trimesh.Trimesh) -> list[np.ndarray]:

@@ -170,7 +170,9 @@ class VehicleRigSpec(BaseModel):
     """Wheel cut regions in model space; wheels are partitioned out of the mesh."""
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
-    wheels: list[VehicleWheelSpec] = Field(min_length=1, max_length=8)
+    # Heavy vehicles commonly have three or more axles. Keep this bounded so a
+    # malformed request cannot turn partitioning into an unbounded O(faces × wheels) job.
+    wheels: list[VehicleWheelSpec] = Field(min_length=1, max_length=16)
     strip_ground: bool = True
 
     @model_validator(mode="after")

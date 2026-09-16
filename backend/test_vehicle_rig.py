@@ -17,15 +17,16 @@ from .storage import JobStore
 from .telemetry import StageTelemetry
 
 
-def _synthetic_vehicle() -> bytes:
-    """Box chassis + 4 wheel cylinders (axles along X) + a floor sheet."""
+def _synthetic_vehicle(axle_positions=(0.55, -0.55)) -> bytes:
+    """Box chassis + paired wheel cylinders (axles along X) + a floor sheet."""
     parts = [trimesh.creation.box(extents=[1.0, 0.4, 2.0])]
     parts[0].apply_translation([0, -0.05, 0])
     rot = trimesh.transformations.rotation_matrix(np.pi / 2, [0, 1, 0])
-    for x, z in [(-0.45, 0.55), (0.45, 0.55), (-0.45, -0.55), (0.45, -0.55)]:
-        wheel = trimesh.creation.cylinder(radius=0.18, height=0.12, sections=32, transform=rot)
-        wheel.apply_translation([x, -0.3, z])
-        parts.append(wheel)
+    for z in axle_positions:
+        for x in (-0.45, 0.45):
+            wheel = trimesh.creation.cylinder(radius=0.18, height=0.12, sections=32, transform=rot)
+            wheel.apply_translation([x, -0.3, z])
+            parts.append(wheel)
     floor = trimesh.creation.box(extents=[4.0, 0.002, 4.0])
     floor.apply_translation([0, -0.481, 0])
     parts.append(floor)
@@ -77,6 +78,28 @@ class GeometryTests(unittest.TestCase):
         checks, blocking = vehicle_rig.rig_quality_checks(glb, spec)
         self.assertIn("rig-chassis-present", checks)
         self.assertEqual(blocking, [])
+
+    def test_partition_supports_six_wheels(self) -> None:
+        wheels = [
+            VehicleWheelSpec(name=f"Wheel_{side}_{axle}", center=(x, -0.3, z), radius=0.19, half_width=0.08, steer=axle == "Front")
+            for axle, z in (("Front", 0.7), ("Middle", 0.0), ("Rear", -0.7))
+            for side, x in (("L", -0.45), ("R", 0.45))
+        ]
+        spec = _spec(wheels)
+        glb, report = vehicle_rig.build_rigged_glb(_synthetic_vehicle((0.7, 0.0, -0.7)), spec)
+        self.assertEqual(len(report["wheels"]), 6)
+        self.assertTrue(all(entry["faces"] > 0 for entry in report["wheels"]))
+        checks, blocking = vehicle_rig.rig_quality_checks(glb, spec)
+        self.assertEqual(blocking, [])
+        self.assertEqual(sum(item.startswith("rig-wheel-") for item in checks), 6)
+
+    def test_suggest_wheel_regions_finds_six_detached_wheels(self) -> None:
+        mesh = vehicle_rig.load_single_mesh(_synthetic_vehicle((0.7, 0.0, -0.7)))
+        stripped, _ = vehicle_rig.strip_ground_plane(mesh)
+        wheels = vehicle_rig.suggest_wheel_regions(stripped)
+        self.assertEqual(len(wheels), 6)
+        self.assertEqual(len({wheel.name for wheel in wheels}), 6)
+        self.assertEqual(sum(wheel.steer for wheel in wheels), 2)
 
     def test_wheel_geometry_recentred_on_axle(self) -> None:
         spec = _spec()

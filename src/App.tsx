@@ -827,7 +827,10 @@ function App() {
           ) : activeTab === 'edit' ? (
             <EditPanel job={job} ready={ready} t2iEnabled={t2iEnabled} prompt={editPrompt} onPromptChange={value => { setEditPrompt(value); setEditPreview(null); }} seed={editSeed} onSeedChange={value => { setEditSeed(value); setEditPreview(null); }} scaffold={scaffold} onScaffoldChange={setScaffold} preview={editPreview} busy={editBusy} error={editError} actionPending={actionPending} workerBusy={workerBusy} onPreview={() => void generateEditPreview()} onApply={() => void applyRetexture()} />
           ) : activeTab === 'rig' ? (
-            <RigPanel job={job} ready={ready} wheels={wheels} markingIndex={markingIndex} busy={rigBusy} error={rigError} actionPending={actionPending} onSuggest={() => void suggestVehicleWheels()} onUpdateWheel={updateWheel} onMark={index => setMarkingIndex(current => (current === index ? null : index))} onAddWheel={() => setWheels(current => [...(current ?? []), { name: `Wheel_${(current?.length ?? 0) + 1}`, center: [0, 0, 0], axis: [1, 0, 0], radius: 0.15, half_width: 0.08, steer: false }])} onRemoveWheel={index => setWheels(current => (current ? current.filter((_, i) => i !== index) : current))} onBuild={() => void buildVehicleRig()} />
+            <RigPanel job={job} ready={ready} wheels={wheels} markingIndex={markingIndex} busy={rigBusy} error={rigError} actionPending={actionPending} onSuggest={() => void suggestVehicleWheels()} onUpdateWheel={updateWheel} onMark={index => setMarkingIndex(current => (current === index ? null : index))} onAddWheel={() => setWheels(current => {
+              if ((current?.length ?? 0) >= 16) return current;
+              return [...(current ?? []), { name: `Wheel_${(current?.length ?? 0) + 1}`, center: [0, 0, 0], axis: [1, 0, 0], radius: 0.15, half_width: 0.08, steer: false }];
+            })} onRemoveWheel={index => setWheels(current => (current ? current.filter((_, i) => i !== index) : current))} onBuild={() => void buildVehicleRig()} />
           ) : (
             <UnityPanel job={job} ready={ready} report={validationReport} onResume={() => void runAction('resume')} />
           )}
@@ -1024,7 +1027,7 @@ function RigPanel({ job, ready, wheels, markingIndex, busy, error, actionPending
       <p className="muted">Wheel marking needs a finished mesh — wait for the shape stage to complete.</p>
     ) : (
       <>
-        <div className="vram-callout"><Sparkles size={17} /><div><strong>Wheel cylinders, not bones</strong><p>Each marker is a cylinder around an axle — faces inside become that wheel's mesh. Suggest fills in guesses; click Place then click the model to correct a center.</p></div></div>
+        <div className="vram-callout"><Sparkles size={17} /><div><strong>Wheel cylinders, not bones</strong><p>Each marker is a cylinder around an axle — faces inside become that wheel's mesh. Auto-suggest starts with a conventional four-wheel layout; add and place markers for every extra axle.</p></div></div>
         <button type="button" className="ghost-button full" disabled={busy || actionPending || !isTerminalStage(job.stage)} onClick={onSuggest}>
           {busy ? <LoaderCircle size={14} /> : <Sparkles size={14} />}{busy ? 'Analyzing mesh…' : wheels ? 'Re-suggest wheels' : 'Auto-suggest wheels'}
         </button>
@@ -1055,12 +1058,12 @@ function RigPanel({ job, ready, wheels, markingIndex, busy, error, actionPending
             ))}
           </div>
         ) : null}
-        <button type="button" className="ghost-button full" onClick={onAddWheel}><ImagePlus size={14} />Add wheel marker</button>
+        <button type="button" className="ghost-button full" disabled={(wheels?.length ?? 0) >= 16} onClick={onAddWheel}><ImagePlus size={14} />Add wheel marker</button>
         {error ? <p className="error-text" role="alert">{error}</p> : null}
         <button type="button" className="primary-button full" disabled={!wheels?.length || busy || actionPending || !isTerminalStage(job.stage)} onClick={onBuild}>
           <Sparkles size={16} />{actionPending ? 'Building rig…' : 'Build rigged child job'}
         </button>
-        <p className="field-hint">Creates a child job — wheels are partitioned onto their own pivots, Unity export and validation rerun, and the package ships a WheelCollider setup script.</p>
+        <p className="field-hint">Supports up to 16 wheels. Creates a child job — every wheel is partitioned onto its own pivot, then Unity export and validation rerun with a WheelCollider setup script.</p>
       </>
     )}
   </div>;
