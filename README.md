@@ -136,9 +136,6 @@ The current implementation has real target-GPU evidence for text/image generatio
 - [Product and technical design](docs/HUNYFORGE_DESIGN.md)
 - [Verification ledger](docs/VERIFICATION.md)
 - [Current delivery status](STATUS.md)
-- [Performance and GUI plan](PERFORMANCE_AND_GUI_ENHANCEMENT_PLAN.md)
-- [Text enhancement plan](TEXT_ENHANCEMENT_PLAN.md)
-- [Vehicle rigging plan](VEHICLE_RIGGING_PLAN.md)
 
 ## Troubleshooting
 

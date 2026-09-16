@@ -8,7 +8,7 @@
 ## Start here
 
 1. Read this file.
-2. Read `STATUS.md`, `docs/HUNYFORGE_DESIGN.md`, and `PERFORMANCE_AND_GUI_ENHANCEMENT_PLAN.md` for the broader product contract. Treat this handoff as newer than their 2026-09-11 verification claims.
+2. Read `STATUS.md` and `docs/HUNYFORGE_DESIGN.md` for the broader product contract. Treat this handoff as newer than their 2026-09-11 verification claims.
 3. Preserve unrelated workspace files. This directory is not currently a Git repository, so there is no commit or clean working-tree baseline.
 4. Do not start another GPU job until `nvidia-smi` confirms the prior worker is idle.
 5. Continue with the fresh end-to-end validation described under **Next work**.
@@ -205,7 +205,7 @@ Do not call Unity export production-ready until this editor test passes.
 
 ### P1 — checkpoint-aware history and resume
 
-The current retry endpoint restarts from the beginning. Implement the existing design TODO in `docs/HUNYFORGE_DESIGN.md` and `PERFORMANCE_AND_GUI_ENHANCEMENT_PLAN.md`:
+The current retry endpoint restarts from the beginning. Implement the existing design TODO in `docs/HUNYFORGE_DESIGN.md`:
 
 - persist immutable checkpoints after shape, mesh processing, PBR, Unity preparation, and validation;
 - verify checkpoint integrity and pipeline/model compatibility;

@@ -19,7 +19,7 @@
 - Real text-to-3D job `d9ba5f4c` ("off-road buggy" prompt → FLUX reference → full pipeline, Draft preset): all 8 artifacts produced, `input_mode=text`, T2I provenance recorded.
 - Dependency bump verified: diffusers 0.30.0→0.38.0, transformers 4.46→4.51.3, deepspeed removed (broken/unused under torch 2.5.1), `trust_remote_code=True` added for vendored hunyuanpaintpbr pipeline. 106/106 in-container tests + a real shape+texture regression job pass on the new deps.
 
-## Vehicle rigging (verified 2026-09-14, see VEHICLE_RIGGING_PLAN.md)
+## Vehicle rigging (verified 2026-09-14)
 
 - `POST /api/jobs/d9ba5f4c/wheel-suggest` on the real buggy: ground strip removed 364 faces (textured LOD is 20k faces), suggested 4 wheels on the correct X axle — FL/FR steering flagged, radii 0.16–0.18, centers symmetric (±0.45 X, ±0.29/−0.33 Z).
 - Rig child `8928f6fc` (input_mode `vehicle-rig`, parent `d9ba5f4c`): **complete**, all 5 stages green. Artifacts: `vehicle-rigged.glb` (Chassis + 4 wheel nodes, pivots verified on GLB reload), `vehicle-rig-report.json`, regenerated LOD0/LOD1/collision, manifest with `vehicle` block, `unity-package.zip` with `Editor/HunyForgeVehicleSetup.cs`.
