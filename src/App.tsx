@@ -906,7 +906,6 @@ function UnityPanel({ job, ready, report, onResume }: { job: JobUpdate | null; r
     <div className="validation-list">
       <div className={`validation-item ${report ? (reportPassed ? 'passed' : 'failed') : 'warning'}`}><CheckCircle2 size={16} /><span>Backend validation report</span><b>{report ? report.status.toUpperCase() : 'PENDING'}</b></div>
       <div className={`validation-item ${extrasState === 'PASS' ? 'passed' : extrasState === 'SKIPPED' ? 'warning' : 'warning'}`}><Gauge size={16} /><span>LOD and collision artifacts</span><b>{extrasState}</b></div>
-      <div className="validation-item warning"><Box size={16} /><span>Unity Editor import remains a manual quality gate</span><b>REVIEW</b></div>
     </div>
     {report?.warnings?.length ? <ul className="warning-list">{report.warnings.map((entry, index) => <li key={index}>{warningText(entry)}</li>)}</ul> : null}
     {report?.blocking_failures?.length ? <ul className="warning-list blocking">{report.blocking_failures.map((entry, index) => <li key={index}>{entry.check}</li>)}</ul> : null}
