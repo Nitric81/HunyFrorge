@@ -36,6 +36,39 @@ from .telemetry import StageTelemetry
 from . import vehicle_rig
 
 UNITY_DIR = Path(__file__).resolve().parent / "unity"
+UNREAL_DIR = Path(__file__).resolve().parent / "unreal"
+
+# The Unity and Unreal exports share the same derived geometry; only the
+# artifact names, manifest, and package layout differ per engine.
+UNREAL_ARTIFACT_NAMES = {
+    "unity-lod0.glb": "unreal-lod0.glb",
+    "unity-lod1.glb": "unreal-lod1.glb",
+    "unity-collision.glb": "unreal-collision.glb",
+}
+
+UNREAL_PACKAGE_README = """HunyForge Unreal Engine package
+
+Contents: SM_*.glb render mesh, optional *_LOD1.glb and Collision_*.glb,
+hunyforge-unreal-manifest.json, validation-report.json, and
+HunyForgeUnrealSetup.py (Unreal Editor Python setup).
+
+Automated install (recommended):
+  From the HunyForge workspace run
+    .\\scripts\\setup-unreal.ps1 -ProjectPath <your>.uproject -PackageZip <this .zip>
+  It resolves the UE install, enables the required plugins in the .uproject,
+  extracts this package, and runs HunyForgeUnrealSetup.py headless.
+
+Manual install:
+  1. Enable Python Editor Script Plugin, Editor Scripting Utilities, and the
+     Interchange glTF importer (Edit > Plugins) and restart the editor.
+  2. Extract this zip, then run HunyForgeUnrealSetup.py from the editor's
+     Python console or headless:
+       UnrealEditor-Cmd.exe <project>.uproject -ExecutePythonScript="<path>/HunyForgeUnrealSetup.py" -unattended
+  3. Check hunyforge-unreal-result.json for steps that remain manual.
+
+Vehicle rigs: the manifest's vehicle block carries wheel pivots/radii for
+manual Chaos Vehicles setup; rigid wheel partitions are not a SkeletalMesh.
+"""
 
 
 class InferenceAdapter:
@@ -820,6 +853,11 @@ class Pipeline:
                 produced, notes = await self._await_operation(asyncio.to_thread(prepare_unity_geometry, data, settings, telemetry), job, "unity")
             for name, content in produced.items():
                 self.store.add_artifact(job, name, content)
+            produced_unreal: dict[str, bytes] = {}
+            if job.unreal_export:
+                produced_unreal = {UNREAL_ARTIFACT_NAMES[name]: content for name, content in produced.items() if name in UNREAL_ARTIFACT_NAMES}
+                for name, content in produced_unreal.items():
+                    self.store.add_artifact(job, name, content)
             shape_checks, texture_checks, unity_ready = await self._await_operation(asyncio.to_thread(self._export_checks, job), job, "unity")
             manifest = {
                 "job_id": str(job.id),
@@ -854,7 +892,43 @@ class Pipeline:
                     "suggested": {"suspension_distance": 0.1, "wheel_mass": 20.0, "chassis_mass": 1200.0},
                 }
             self.store.add_artifact(job, "hunyforge-manifest.json", json.dumps(manifest, indent=2).encode())
-            job.unity_checkpoint = self.store.make_checkpoint(job, list(produced) + ["hunyforge-manifest.json"])
+            checkpoint_artifacts = list(produced) + ["hunyforge-manifest.json"]
+            if job.unreal_export:
+                unreal_manifest = {
+                    **{key: manifest[key] for key in ("job_id", "parent_job_id", "schema_version", "backend", "seed", "preset", "settings", "model_revision", "runtime_config")},
+                    "unreal_ready": unity_ready,
+                    "format": "glb",
+                    "triangle_budget": settings.face_count,
+                    "scale": 100.0,
+                    "axis": "Y-up glTF source; importer converts to Z-up",
+                    "units": "cm after import",
+                    "source_mesh": source_name,
+                    "lods": [name for name in ("unreal-lod0.glb", "unreal-lod1.glb") if name in produced_unreal],
+                    "collision": "unreal-collision.glb" if "unreal-collision.glb" in produced_unreal else None,
+                    "collision_mode": settings.collision_mode if settings.generate_collision else None,
+                    "memory_policy": "sequential-shape-texture",
+                    "geometry_notes": notes,
+                    "artifacts": {name: sha256_file(directory / name) for name in produced_unreal},
+                    "telemetry": self._collect_telemetry(job),
+                    "checks": {"shape": shape_checks, "texture": texture_checks},
+                    "import": {
+                        "pipeline": "interchange",
+                        "setup_script": "HunyForgeUnrealSetup.py",
+                        "plugin_requirements": ["Python Editor Script Plugin", "Editor Scripting Utilities", "Interchange (glTF import)"],
+                    },
+                }
+                if job.rig_spec:
+                    unreal_manifest["vehicle"] = {
+                        "source_mesh": source_name,
+                        "wheels": [wheel.model_dump() for wheel in job.rig_spec.wheels],
+                        "chassis_node": "Chassis",
+                        "units": "cm after import (pivot values are model-space meters)",
+                        "suggested": {"suspension_distance_cm": 10.0, "wheel_mass_kg": 20.0, "chassis_mass_kg": 1200.0},
+                        "setup": "manual - ChaosWheeledVehiclePawn; see package README.md",
+                    }
+                self.store.add_artifact(job, "hunyforge-unreal-manifest.json", json.dumps(unreal_manifest, indent=2).encode())
+                checkpoint_artifacts += list(produced_unreal) + ["hunyforge-unreal-manifest.json"]
+            job.unity_checkpoint = self.store.make_checkpoint(job, checkpoint_artifacts)
         except Exception as exc:
             if self._cancel_pending(job):
                 self._stage_finish(job, "unity", "cancelled")
@@ -955,6 +1029,50 @@ class Pipeline:
                         blocking.append(f"export-{name}-uv-material")
             else:
                 export_checks.append(f"{name}-present")
+        unreal_checks: list[str] = []
+        unreal_blocking: list[str] = []
+        unreal_ready = None
+        if job.unreal_export:
+            unreal_expected_lods = ["unreal-lod0.glb"] + (["unreal-lod1.glb"] if settings.generate_lods else [])
+            unreal_expected_collision = "unreal-collision.glb" if settings.generate_collision else None
+            unreal_expected = unreal_expected_lods + ([unreal_expected_collision] if unreal_expected_collision else []) + ["hunyforge-unreal-manifest.json"]
+            unreal_manifest_path = directory / "hunyforge-unreal-manifest.json"
+            if unreal_manifest_path.is_file():
+                unreal_manifest = json.loads(unreal_manifest_path.read_text(encoding="utf-8"))
+                if unreal_manifest.get("lods") != unreal_expected_lods:
+                    unreal_blocking.append("unreal-manifest-lod-mismatch")
+                if unreal_manifest.get("collision") != unreal_expected_collision:
+                    unreal_blocking.append("unreal-manifest-collision-mismatch")
+                recorded = unreal_manifest.get("artifacts") or {}
+                for name in unreal_expected_lods + ([unreal_expected_collision] if unreal_expected_collision else []):
+                    path = directory / name
+                    if name not in recorded:
+                        unreal_blocking.append(f"unreal-manifest-hash-missing-{name}")
+                    elif path.is_file() and recorded[name] != sha256_file(path):
+                        unreal_blocking.append(f"unreal-manifest-hash-mismatch-{name}")
+            else:
+                unreal_blocking.append("unreal-manifest-missing")
+            for name in unreal_expected:
+                path = directory / name
+                if not path.is_file():
+                    unreal_checks.append(f"{name}-missing")
+                    unreal_blocking.append(f"unreal-export-{name}")
+                elif name.endswith(".glb"):
+                    file_bytes = path.read_bytes()
+                    checks = validate_glb(file_bytes)
+                    if "non-empty-mesh" in checks and "finite-vertices" in checks:
+                        unreal_checks.append(f"{name}-present")
+                    else:
+                        unreal_checks.append(f"{name}-invalid")
+                        unreal_blocking.append(f"unreal-export-{name}")
+                    if job.texture and job.backend != "demo" and name in unreal_expected_lods:
+                        quality = texture_quality_checks(file_bytes)
+                        if "uv-coordinates-present" not in quality or "material-present" not in quality:
+                            unreal_blocking.append(f"unreal-export-{name}-uv-material")
+                else:
+                    unreal_checks.append(f"{name}-present")
+            blocking += unreal_blocking
+            unreal_ready = not unreal_blocking
         warnings = []
         if job.backend == "demo":
             warnings.append({"severity": "info", "message": "Demo geometry is a test artifact; replace with Hunyuan output before production use."})
@@ -974,7 +1092,8 @@ class Pipeline:
             "source_manifest_job_id": manifest.get("job_id"),
             "geometry_processing": manifest.get("geometry_notes", []),
             "memory_policy": "sequential-shape-texture",
-            "checks": {"shape": shape_checks, "texture": texture_checks, "export": export_checks},
+            "unreal_ready": unreal_ready,
+            "checks": {"shape": shape_checks, "texture": texture_checks, "export": export_checks, "unreal": unreal_checks},
         }
         return report, ok
 
@@ -992,6 +1111,30 @@ class Pipeline:
             if rigged and setup_script.is_file():
                 archive.write(setup_script, "Assets/HunyForge/Editor/HunyForgeVehicleSetup.cs")
             archive.writestr("Assets/HunyForge/README.md", "Import the GLB into Unity. Review the validation report before production use.\n" + ("For rigged vehicles run HunyForge → Setup Vehicle Colliders after import.\n" if rigged else ""))
+
+    def _write_unreal_package(self, job: JobStatus, staging: Path) -> None:
+        directory = self.store.path(job.id) / "artifacts"
+        staging.parent.mkdir(parents=True, exist_ok=True)
+        asset = f"SM_{str(job.id).replace('-', '')[:8]}"
+        renamed = {
+            "unreal-lod0.glb": f"{asset}.glb",
+            "unreal-lod1.glb": f"{asset}_LOD1.glb",
+            "unreal-collision.glb": f"Collision_{asset}.glb",
+        }
+        extras = ["hunyforge-unreal-manifest.json", "validation-report.json", "vehicle-rig-report.json"]
+        setup_script = UNREAL_DIR / "HunyForgeUnrealSetup.py"
+        with zipfile.ZipFile(staging, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, target in renamed.items():
+                source = directory / name
+                if source.is_file():
+                    archive.write(source, f"HunyForge/{target}")
+            for name in extras:
+                source = directory / name
+                if source.is_file():
+                    archive.write(source, f"HunyForge/{name}")
+            if setup_script.is_file():
+                archive.write(setup_script, "HunyForge/HunyForgeUnrealSetup.py")
+            archive.writestr("HunyForge/README.md", UNREAL_PACKAGE_README)
 
     async def _validation_stage(self, job: JobStatus, settings: GenerationSettings, telemetry: StageTelemetry) -> bool:
         if self._cancel_pending(job):
@@ -1012,8 +1155,14 @@ class Pipeline:
             with telemetry.measure("packaging"):
                 await self._await_operation(asyncio.to_thread(self._write_package, job, staging), job, "validation")
             self.store.commit_artifact(job, "unity-package.zip", staging)
+            if job.unreal_export:
+                unreal_staging = self.store.path(job.id) / "staging" / "unreal-package.zip"
+                with telemetry.measure("packaging"):
+                    await self._await_operation(asyncio.to_thread(self._write_unreal_package, job, unreal_staging), job, "validation")
+                self.store.commit_artifact(job, "unreal-package.zip", unreal_staging)
         except Exception as exc:
             staging.unlink(missing_ok=True)
+            (self.store.path(job.id) / "staging" / "unreal-package.zip").unlink(missing_ok=True)
             if self._cancel_pending(job):
                 self._stage_finish(job, "validation", "cancelled")
                 self._finalize_cancel(job, "validation")

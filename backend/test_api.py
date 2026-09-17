@@ -94,6 +94,43 @@ class ApiContractTests(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertEqual(result["stage"], "complete")
 
+    def test_unreal_export_job_serves_unreal_package(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            main.store = JobStore(Path(directory))
+            main.pipeline = Pipeline(main.store)
+            with TestClient(main.app) as client:
+                job = _demo_job(client, unreal_export=True)
+                self.assertTrue(job["unreal_export"])
+                artifacts = client.get(f"/api/jobs/{job['id']}/artifacts").json()["artifacts"]
+                self.assertIn("artifacts/unreal-package.zip", artifacts)
+                self.assertIn("artifacts/hunyforge-unreal-manifest.json", artifacts)
+                download = client.get(f"/api/jobs/{job['id']}/artifacts/unreal-package.zip")
+                self.assertEqual(download.status_code, 200)
+                self.assertGreater(len(download.content), 0)
+                validation = client.get(f"/api/jobs/{job['id']}/validation")
+                self.assertTrue(validation.json()["unreal_ready"])
+
+    def test_unreal_export_propagates_to_retry_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            main.store = JobStore(Path(directory))
+            main.pipeline = Pipeline(main.store)
+            failed = JobStatus(backend="demo", stage=JobStage.FAILED, project_id=None, seed=99, texture=True, unreal_export=True, parameters={"seed": 99})
+            main.store.save(failed)
+            with TestClient(main.app) as client:
+                response = client.post(f"/api/jobs/{failed.id}/retry")
+                self.assertEqual(response.status_code, 202)
+                child = response.json()
+                self.assertTrue(child["unreal_export"])
+                result = {}
+                for _ in range(500):
+                    result = client.get(f"/api/jobs/{child['id']}").json()
+                    if result["stage"] == "complete":
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(result["stage"], "complete")
+                artifacts = client.get(f"/api/jobs/{child['id']}/artifacts").json()["artifacts"]
+                self.assertIn("artifacts/unreal-package.zip", artifacts)
+
     def test_multi_view_job_requires_cardinal_views_and_redacts_source_data(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             main.store = JobStore(Path(directory))

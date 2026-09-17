@@ -302,6 +302,90 @@ class PipelineTests(unittest.TestCase):
             blocking = {entry["check"] for entry in report["blocking_failures"]}
             self.assertIn("manifest-hash-missing-unity-lod1.glb", blocking)
 
+    def test_demo_pipeline_unreal_export_emits_package(self) -> None:
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = JobStore(Path(directory))
+            job = JobStatus(backend="demo", texture=True, unreal_export=True)
+            store.save(job)
+            asyncio.run(Pipeline(store).run(job))
+            result = store.get(job.id)
+            assert result is not None
+            self.assertEqual(result.stage, JobStage.COMPLETE)
+            artifacts = store.path(job.id) / "artifacts"
+            for name in ("unreal-lod0.glb", "unreal-lod1.glb", "unreal-collision.glb", "hunyforge-unreal-manifest.json", "unreal-package.zip"):
+                self.assertTrue((artifacts / name).is_file(), name)
+            manifest = json.loads((artifacts / "hunyforge-unreal-manifest.json").read_text())
+            self.assertEqual(manifest["scale"], 100.0)
+            self.assertEqual(manifest["collision_mode"], _settings().collision_mode)
+            self.assertEqual(manifest["lods"], ["unreal-lod0.glb", "unreal-lod1.glb"])
+            self.assertEqual(manifest["collision"], "unreal-collision.glb")
+            self.assertEqual(manifest["import"]["pipeline"], "interchange")
+            self.assertEqual(manifest["artifacts"]["unreal-lod0.glb"], sha256_file(artifacts / "unreal-lod0.glb"))
+            report = json.loads((artifacts / "validation-report.json").read_text())
+            self.assertTrue(report["unreal_ready"])
+            self.assertIn("unreal-lod0.glb-present", report["checks"]["unreal"])
+            asset = f"SM_{str(job.id).replace('-', '')[:8]}"
+            with zipfile.ZipFile(artifacts / "unreal-package.zip") as package:
+                names = set(package.namelist())
+            self.assertIn(f"HunyForge/{asset}.glb", names)
+            self.assertIn(f"HunyForge/{asset}_LOD1.glb", names)
+            self.assertIn(f"HunyForge/Collision_{asset}.glb", names)
+            self.assertIn("HunyForge/hunyforge-unreal-manifest.json", names)
+            self.assertIn("HunyForge/validation-report.json", names)
+            self.assertIn("HunyForge/HunyForgeUnrealSetup.py", names)
+            self.assertIn("HunyForge/README.md", names)
+
+    def test_demo_pipeline_without_unreal_flag_emits_no_unreal_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = JobStore(Path(directory))
+            job = JobStatus(backend="demo", texture=True)
+            store.save(job)
+            asyncio.run(Pipeline(store).run(job))
+            result = store.get(job.id)
+            assert result is not None
+            self.assertEqual(result.stage, JobStage.COMPLETE)
+            self.assertFalse(any("unreal" in name for name in result.artifacts))
+            report = json.loads((store.path(job.id) / "artifacts" / "validation-report.json").read_text())
+            self.assertIsNone(report["unreal_ready"])
+            self.assertEqual(report["checks"]["unreal"], [])
+
+    def test_validation_blocks_missing_unreal_export(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = JobStore(Path(directory))
+            job = JobStatus(backend="hunyuan3d-2.1", texture=True, unreal_export=True)
+            store.save(job)
+            artifacts = store.path(job.id) / "artifacts"
+            artifacts.mkdir(parents=True, exist_ok=True)
+            from .pipeline import make_demo_glb
+
+            textured = _textured_glb()
+            settings = _settings(generate_collision=False)
+            files = {
+                "white-mesh.glb": make_demo_glb(),
+                "textured-mesh.glb": textured,
+                "unity-lod0.glb": textured,
+                "unity-lod1.glb": textured,
+                "unreal-lod0.glb": textured,
+            }
+            for name, content in files.items():
+                (artifacts / name).write_bytes(content)
+            manifest = {
+                "job_id": str(job.id),
+                "lods": ["unity-lod0.glb", "unity-lod1.glb"],
+                "collision": None,
+                "artifacts": {name: sha256_file(artifacts / name) for name in ("unity-lod0.glb", "unity-lod1.glb")},
+            }
+            (artifacts / "hunyforge-manifest.json").write_text(json.dumps(manifest))
+            report, ok = Pipeline(store)._build_validation_report(job, settings)
+            self.assertFalse(ok)
+            self.assertFalse(report["unreal_ready"])
+            blocking = {entry["check"] for entry in report["blocking_failures"]}
+            self.assertIn("unreal-export-unreal-lod1.glb", blocking)
+            self.assertIn("unreal-manifest-missing", blocking)
+            self.assertIn("unreal-lod0.glb-present", report["checks"]["unreal"])
+
 
 if __name__ == "__main__":
     unittest.main()

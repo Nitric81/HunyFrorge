@@ -90,6 +90,7 @@ function App() {
   const [backendChoice, setBackendChoice] = useState<'hunyuan3d-2.1' | 'hunyuan3d-omni'>('hunyuan3d-2.1');
   const [seed, setSeed] = useState('48291');
   const [texture, setTexture] = useState(true);
+  const [unrealExport, setUnrealExport] = useState(false);
   const [controlType, setControlType] = useState('point');
   const [controlData, setControlData] = useState<string | null>(null);
   const [controlName, setControlName] = useState('');
@@ -557,6 +558,7 @@ function App() {
         prompt: textMode ? promptText.trim() : null,
         t2i_seed: textMode ? Number(t2iSeed) : null,
         asset_type: assetType,
+        unreal_export: unrealExport,
         parameters: settings,
       };
       const created = await submitJob(payload);
@@ -681,6 +683,7 @@ function App() {
               ) : null}
               <span className="pill neutral">GLB</span>
               {jobId && ready.includes('unity-package.zip') ? <a className="icon-button" aria-label="Download Unity package" href={artifactUrl(jobId, 'unity-package.zip')} download><Download size={16} /></a> : <button className="icon-button" aria-label="Download Unity package" disabled><Download size={16} /></button>}
+              {job?.unreal_export ? (jobId && ready.includes('unreal-package.zip') ? <a className="icon-button" aria-label="Download Unreal package" title="Download unreal-package.zip" href={artifactUrl(jobId, 'unreal-package.zip')} download>UE</a> : <button className="icon-button" aria-label="Download Unreal package" disabled>UE</button>) : null}
             </div>
           </div>
           <div className="viewport">
@@ -702,7 +705,7 @@ function App() {
           </div>
         </section>
         <aside className="inspector">
-          <div className="tabs"><button className={activeTab === 'generate' ? 'tab active' : 'tab'} onClick={() => setActiveTab('generate')}>Generate</button><button className={activeTab === 'edit' ? 'tab active' : 'tab'} onClick={() => setActiveTab('edit')}>Edit</button><button className={`tab ${activeTab === 'rig' ? 'active' : ''} ${job?.asset_type === 'vehicle' || job?.input_mode === 'vehicle-rig' ? '' : 'disabled'}`} onClick={() => setActiveTab('rig')}>Rig</button><button className={activeTab === 'unity' ? 'tab active' : 'tab'} onClick={() => setActiveTab('unity')}>Unity prepare</button></div>
+          <div className="tabs"><button className={activeTab === 'generate' ? 'tab active' : 'tab'} onClick={() => setActiveTab('generate')}>Generate</button><button className={activeTab === 'edit' ? 'tab active' : 'tab'} onClick={() => setActiveTab('edit')}>Edit</button><button className={`tab ${activeTab === 'rig' ? 'active' : ''} ${job?.asset_type === 'vehicle' || job?.input_mode === 'vehicle-rig' ? '' : 'disabled'}`} onClick={() => setActiveTab('rig')}>Rig</button><button className={activeTab === 'unity' ? 'tab active' : 'tab'} onClick={() => setActiveTab('unity')}>Engine export</button></div>
           {activeTab === 'generate' ? (
             <form className="inspector-body" ref={formRef} onSubmit={onSubmit}>
               <div className="section-heading"><div><h2>New generation</h2><p>Stage a local asset run</p></div><span className="pill teal">LOCAL</span></div>
@@ -788,6 +791,7 @@ function App() {
                   </select>
                 </label>
               </div>
+              <label className="toggle-row"><span><strong>Unreal package</strong><small>Also emit unreal-package.zip — GLB files plus an Editor Python setup script</small></span><input type="checkbox" checked={unrealExport} onChange={event => setUnrealExport(event.target.checked)} /></label>
               <label className="field-label">Seed
                 <input type="number" name="seed" autoComplete="off" required min={0} max={4294967295} step={1} value={seed} onChange={event => setSeed(event.target.value)} />
                 <span className="field-hint">0 – 4294967295</span>
@@ -883,7 +887,7 @@ function StageRow({ row, job }: { row: { key: StageName; label: string }; job: J
 
 function UnityPanel({ job, ready, report, onResume }: { job: JobUpdate | null; ready: string[]; report: ValidationReport | null; onResume: () => void }) {
   if (!job) {
-    return <div className="inspector-body"><div className="section-heading"><div><h2>Unity preparation</h2><p>Select a job to inspect its export</p></div><ShieldCheck size={20} className="teal-icon" /></div><p className="muted">Generate an asset first — Unity settings and validation appear here.</p></div>;
+    return <div className="inspector-body"><div className="section-heading"><div><h2>Engine export</h2><p>Select a job to inspect its export</p></div><ShieldCheck size={20} className="teal-icon" /></div><p className="muted">Generate an asset first — Unity/Unreal settings and validation appear here.</p></div>;
   }
   const settings = job.parameters ?? {};
   const exportActions = (job.resume_stage === 'unity' || job.resume_stage === 'validation') && (job.available_actions.includes('resume') || job.available_actions.includes('resume_unity'));
@@ -893,8 +897,10 @@ function UnityPanel({ job, ready, report, onResume }: { job: JobUpdate | null; r
   const requestedReady = requestedFiles.every(name => ready.includes(name));
   const reportPassed = report?.status === 'passed';
   const extrasState = !lodRequested && !collisionRequested ? 'SKIPPED' : reportPassed && requestedReady ? 'PASS' : 'REVIEW';
+  const unrealEnabled = Boolean(job.unreal_export);
+  const unrealState = !unrealEnabled ? null : report?.unreal_ready === true ? 'PASS' : report?.unreal_ready === false ? 'FAIL' : 'PENDING';
   return <div className="inspector-body">
-    <div className="section-heading"><div><h2>Unity preparation</h2><p>Export settings for {job.preset} preset</p></div><ShieldCheck size={20} className="teal-icon" /></div>
+    <div className="section-heading"><div><h2>Engine export</h2><p>Export settings for {job.preset} preset</p></div><ShieldCheck size={20} className="teal-icon" /></div>
     <dl className="settings-list">
       <div><dt>Backend</dt><dd>{job.backend}</dd></div>
       <div><dt>Seed</dt><dd>{job.seed}</dd></div>
@@ -902,10 +908,12 @@ function UnityPanel({ job, ready, report, onResume }: { job: JobUpdate | null; r
       {(['face_count', 'unity_mode', 'collision_mode', 'texture_size', 'render_size', 'max_num_view'] as const).map(key => <div key={key}><dt>{key.replace(/_/g, ' ')}</dt><dd>{String(settings[key] ?? '—')}</dd></div>)}
       <div><dt>Generate LODs</dt><dd>{lodRequested ? 'Requested' : 'Skipped'}</dd></div>
       <div><dt>Generate collision</dt><dd>{collisionRequested ? 'Requested' : 'Skipped'}</dd></div>
+      <div><dt>Unreal package</dt><dd>{unrealEnabled ? 'Requested' : 'Off'}</dd></div>
     </dl>
     <div className="validation-list">
       <div className={`validation-item ${report ? (reportPassed ? 'passed' : 'failed') : 'warning'}`}><CheckCircle2 size={16} /><span>Backend validation report</span><b>{report ? report.status.toUpperCase() : 'PENDING'}</b></div>
       <div className={`validation-item ${extrasState === 'PASS' ? 'passed' : extrasState === 'SKIPPED' ? 'warning' : 'warning'}`}><Gauge size={16} /><span>LOD and collision artifacts</span><b>{extrasState}</b></div>
+      {unrealEnabled ? <div className={`validation-item ${unrealState === 'PASS' ? 'passed' : unrealState === 'FAIL' ? 'failed' : 'warning'}`}><ShieldCheck size={16} /><span>Unreal export validation</span><b>{unrealState}</b></div> : null}
     </div>
     {report?.warnings?.length ? <ul className="warning-list">{report.warnings.map((entry, index) => <li key={index}>{warningText(entry)}</li>)}</ul> : null}
     {report?.blocking_failures?.length ? <ul className="warning-list blocking">{report.blocking_failures.map((entry, index) => <li key={index}>{entry.check}</li>)}</ul> : null}
@@ -914,6 +922,7 @@ function UnityPanel({ job, ready, report, onResume }: { job: JobUpdate | null; r
     </div>
     {exportActions ? <button className="primary-button full" onClick={onResume}><RotateCcw size={15} />Resume export</button> : null}
     {jobIdReady(job, ready) ? <a className="ghost-button full" href={artifactUrl(job.id, 'unity-package.zip')} download><Download size={15} />Export Unity package</a> : <button className="ghost-button full" disabled><Download size={15} />Export Unity package</button>}
+    {unrealEnabled ? (ready.includes('unreal-package.zip') ? <a className="ghost-button full" href={artifactUrl(job.id, 'unreal-package.zip')} download><Download size={15} />Export Unreal package</a> : <button className="ghost-button full" disabled><Download size={15} />Export Unreal package</button>) : null}
   </div>;
 }
 

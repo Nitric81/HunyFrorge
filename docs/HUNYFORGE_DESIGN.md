@@ -157,6 +157,12 @@ Every completed asset must include:
 
 Blocking validation checks include readable files, finite vertices, valid indices, non-empty mesh, UVs when textured, resolvable materials, known scale, recorded axis conversion, texture dimensions/formats, LOD consistency, and collision policy.
 
+## Unreal export contract
+
+Opt-in per job via `unreal_export` (inherited by retexture, rig, and resume children). When enabled, the export stage emits Unreal-named copies of the same derived geometry (`unreal-lod0/1.glb`, `unreal-collision.glb`) plus `hunyforge-unreal-manifest.json` carrying engine semantics — glTF Y-up/meters → UE Z-up/cm conversion notes, `collision_mode`, artifact hashes, an `import` block naming the Interchange pipeline and packaged `HunyForgeUnrealSetup.py`, and a `vehicle` block with Chaos parameter hints for rigged jobs.
+
+Validation mirrors the Unity rules under `unreal-*` check names (missing artifacts, invalid GLBs, UV/material on textured LODs, manifest LOD/collision/hash consistency) and reports `unreal_ready` in `validation-report.json`. The packaged `unreal-package.zip` uses a `HunyForge/` layout (`SM_<id>.glb`, `SM_<id>_LOD1.glb`, `Collision_<id>.glb`, manifest, report, `HunyForgeUnrealSetup.py`, README) consumed by `scripts/setup-unreal.ps1`, which resolves the engine install, enables plugins in the target `.uproject`, and runs the setup headless. Chaos vehicle assembly stays manual; the manifest documents pivots and suggested parameters.
+
 ## Storage and privacy
 
 Use `<workspace>/hunyforge.db` and `<workspace>/projects/<project-id>/assets/<asset-id>/` with separate `inputs`, `generations`, `unity-export`, `previews`, and `logs` folders. Never overwrite a generation. Use content hashes. Bind to localhost, sanitize names, prevent path traversal, constrain external tools with timeouts, and redact secrets from logs.
@@ -168,6 +174,7 @@ Use `<workspace>/hunyforge.db` and `<workspace>/projects/<project-id>/assets/<as
 - **E03 PBR:** staged texture worker, unload/reload, low-VRAM behavior, retry/resume, measured VRAM, texture preview.
 - **E04 Unity:** scale/axis/pivot, materials, texture packing, triangle budgets, LODs, collisions, manifest, validator, package export.
 - **E05 Omni and hardening:** point/voxel/pose/bounding-box inputs, cancellation, recovery, performance, accessibility, release packaging.
+- **E08 Unreal export:** per-job `unreal_export` flag, Unreal-named LOD/collision artifacts, Unreal manifest, `unreal-package.zip` with Editor Python setup script, bootstrap-based engine probing/install.
 
 ## Development TODO — generation history and stage resume
 

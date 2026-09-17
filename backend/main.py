@@ -226,7 +226,7 @@ async def create_job(request: JobCreate) -> JobStatus:
     if request.input_mode == "multi-image" and request.backend != "demo" and not await asyncio.to_thread(multi_view_service_ready):
         raise HTTPException(status_code=503, detail="Multi-view generation requires the local Hunyuan3D-2mv worker. Start it and set HUNYFORGE_MULTI_VIEW_URL; Hunyuan3D 2.1's stock image endpoint does not fuse multiple references.")
     parameters = {**request.parameters, "image": request.image, "reference_images": [item.model_dump() for item in request.reference_images], "seed": request.seed, "control_type": request.control_type, "control_data": request.control_data}
-    job = JobStatus(project_id=request.project_id, backend=request.backend, seed=request.seed, texture=request.texture, image=request.image, reference_images=request.reference_images, control_type=request.control_type, parameters=parameters, preset=request.preset, input_mode=request.input_mode, prompt=request.prompt, t2i_seed=request.t2i_seed, t2i_model=T2I_MODEL_ID if request.t2i_seed is not None else None, asset_type=request.asset_type, model_revision=current_model_revision(), runtime_config=current_runtime_config())
+    job = JobStatus(project_id=request.project_id, backend=request.backend, seed=request.seed, texture=request.texture, image=request.image, reference_images=request.reference_images, control_type=request.control_type, parameters=parameters, preset=request.preset, input_mode=request.input_mode, prompt=request.prompt, t2i_seed=request.t2i_seed, t2i_model=T2I_MODEL_ID if request.t2i_seed is not None else None, asset_type=request.asset_type, unreal_export=request.unreal_export, model_revision=current_model_revision(), runtime_config=current_runtime_config())
     if not pipeline.reserve(job):
         raise HTTPException(status_code=409, detail="GPU worker is busy; wait for the active job to finish or cancel it")
     try:
@@ -259,7 +259,7 @@ async def retexture_job(job_id: UUID, request: RetextureRequest) -> JobStatus:
         raise HTTPException(status_code=422, detail=f"Invalid retexture settings: {e}") from e
     child_seed = request.seed if request.seed is not None else source.seed
     parameters = {**source.parameters, "image": request.image, "seed": child_seed, **settings.model_dump()}
-    child = JobStatus(project_id=source.project_id, backend=source.backend, seed=child_seed, texture=True, image=request.image, reference_images=source.reference_images, control_type=source.control_type, parameters=parameters, preset=source.preset, parent_job_id=source.id, resume_from="texture", input_mode="retexture", prompt=request.prompt, t2i_seed=request.t2i_seed, t2i_model=T2I_MODEL_ID if request.t2i_seed is not None else None, model_revision=current_model_revision(), runtime_config=current_runtime_config())
+    child = JobStatus(project_id=source.project_id, backend=source.backend, seed=child_seed, texture=True, image=request.image, reference_images=source.reference_images, control_type=source.control_type, parameters=parameters, preset=source.preset, parent_job_id=source.id, resume_from="texture", input_mode="retexture", prompt=request.prompt, t2i_seed=request.t2i_seed, t2i_model=T2I_MODEL_ID if request.t2i_seed is not None else None, unreal_export=source.unreal_export, model_revision=current_model_revision(), runtime_config=current_runtime_config())
     if not pipeline.reserve(child):
         raise HTTPException(status_code=409, detail="GPU worker is busy; wait for the active job to finish or cancel it")
     try:
@@ -333,7 +333,7 @@ async def rig_job(job_id: UUID, request: RigRequest) -> JobStatus:
         if wheel.radius > max_extent * 0.6 or wheel.half_width > wheel.radius * 1.5:
             raise HTTPException(status_code=422, detail=f"Wheel {wheel.name} cylinder is implausibly large for this mesh")
     parameters = dict(source.parameters)
-    child = JobStatus(project_id=source.project_id, backend=source.backend, seed=source.seed, texture=source.texture, image=source.image, reference_images=source.reference_images, control_type=source.control_type, parameters=parameters, preset=source.preset, parent_job_id=source.id, resume_from="rig", input_mode="vehicle-rig", asset_type="vehicle", rig_spec=request.rig_spec, model_revision=current_model_revision(), runtime_config=current_runtime_config())
+    child = JobStatus(project_id=source.project_id, backend=source.backend, seed=source.seed, texture=source.texture, image=source.image, reference_images=source.reference_images, control_type=source.control_type, parameters=parameters, preset=source.preset, parent_job_id=source.id, resume_from="rig", input_mode="vehicle-rig", asset_type="vehicle", rig_spec=request.rig_spec, unreal_export=source.unreal_export, model_revision=current_model_revision(), runtime_config=current_runtime_config())
     if not pipeline.reserve(child):
         raise HTTPException(status_code=409, detail="GPU worker is busy; wait for the active job to finish or cancel it")
     try:
@@ -350,7 +350,7 @@ async def rig_job(job_id: UUID, request: RigRequest) -> JobStatus:
 
 
 def _child_job(source: JobStatus, resume_from: str) -> JobStatus:
-    return JobStatus(project_id=source.project_id, backend=source.backend, seed=source.seed, texture=source.texture, image=source.image, reference_images=source.reference_images, control_type=source.control_type, parameters=dict(source.parameters), preset=source.preset, parent_job_id=source.id, resume_from=resume_from, input_mode=source.input_mode, prompt=source.prompt, t2i_seed=source.t2i_seed, t2i_model=source.t2i_model, asset_type=source.asset_type, rig_spec=source.rig_spec, model_revision=current_model_revision(), runtime_config=current_runtime_config())
+    return JobStatus(project_id=source.project_id, backend=source.backend, seed=source.seed, texture=source.texture, image=source.image, reference_images=source.reference_images, control_type=source.control_type, parameters=dict(source.parameters), preset=source.preset, parent_job_id=source.id, resume_from=resume_from, input_mode=source.input_mode, prompt=source.prompt, t2i_seed=source.t2i_seed, t2i_model=source.t2i_model, asset_type=source.asset_type, rig_spec=source.rig_spec, unreal_export=source.unreal_export, model_revision=current_model_revision(), runtime_config=current_runtime_config())
 
 
 async def _start_attempt(source: JobStatus, resume_stage: str) -> JobStatus:

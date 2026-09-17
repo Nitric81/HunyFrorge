@@ -143,6 +143,7 @@ export interface JobUpdate {
   t2i_model?: string | null;
   asset_type?: AssetType;
   rig_spec?: VehicleRigSpec | null;
+  unreal_export?: boolean;
   failed_stage: string | null;
   peak_vram_mb: number | null;
   error_code: string | null;
@@ -157,6 +158,7 @@ export interface ValidationReport {
   attempt_job_id?: string;
   source_manifest_job_id?: string | null;
   geometry_processing?: string[];
+  unreal_ready?: boolean | null;
   checks?: Record<string, string[]>;
 }
 
@@ -180,7 +182,7 @@ export const STAGE_ROWS: { key: StageName; label: string }[] = [
   { key: 'shape', label: 'Shape' },
   { key: 'texture', label: 'Texture' },
   { key: 'rig', label: 'Vehicle rig' },
-  { key: 'unity', label: 'Unity preparation' },
+  { key: 'unity', label: 'Engine export prep' },
   { key: 'validation', label: 'Validation & package' },
 ];
 
@@ -194,8 +196,8 @@ export const STAGE_LABELS: Record<JobStage, string> = {
   loading_texture_model: 'Loading texture model',
   generating_textures: 'Generating PBR textures',
   rigging: 'Partitioning vehicle wheels',
-  preparing_unity_export: 'Preparing Unity export',
-  validating_unity_export: 'Validating Unity export',
+  preparing_unity_export: 'Preparing engine export',
+  validating_unity_export: 'Validating & packaging',
   cancellation_requested: 'Cancellation requested',
   cancelling: 'Cancelling',
   complete: 'Complete',
@@ -352,6 +354,7 @@ export interface JobPayload {
   prompt?: string | null;
   t2i_seed?: number | null;
   asset_type?: AssetType;
+  unreal_export?: boolean;
   parameters: GenerationSettings;
 }
 

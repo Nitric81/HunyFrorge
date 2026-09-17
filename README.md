@@ -9,7 +9,7 @@ It combines a React/Three.js UI with a FastAPI job service and local CUDA infere
 - Generate shape and PBR-textured GLB assets from an image or text prompt.
 - Reconstruct a single asset from a labeled multi-view set using Hunyuan3D-2mv.
 - Keep long-running jobs durable, with stage checkpoints, cancel/retry/resume, SSE progress, and polling fallback.
-- Produce Unity-ready packages with LODs, collision geometry, materials, validation reports, and manifests.
+- Produce engine-ready packages with LODs, collision geometry, materials, validation reports, and manifests — Unity by default, Unreal Engine as a per-job opt-in.
 - Detect and rig vehicle wheels into a GLB with Unity `WheelCollider` setup metadata.
 - Run locally: input images, models, job data, and artifacts are not sent to a cloud inference service.
 
@@ -22,6 +22,14 @@ It combines a React/Three.js UI with a FastAPI job service and local CUDA infere
   - Hunyuan3D-2.1 for image shape generation and PBR texturing.
   - Hunyuan3D-2mv Turbo for native multi-view shape generation (optional unless using Multi view).
   - FLUX.2-klein-4B for text-to-3D and reference-preview features (optional unless using Text).
+
+### Engine targets (optional)
+
+Engine installs are only needed to consume export packages; HunyForge runs without them.
+
+- **Unity Editor** — imports `unity-package.zip` (GLB via the glTFast importer). Verified on Unity 6000.5.8f1 with glTFast 6.20.0; see `unity-smoke-test/`.
+- **Unreal Engine 5.x** — imports `unreal-package.zip` (GLB via the Interchange pipeline). Verified on UE 5.8.2. The engine is auto-detected from the registry and `UE_*` install folders on any drive, or pass `-EnginePath`.
+  - Required plugins are enabled automatically by the bootstrap script: Python Editor Script Plugin, Editor Scripting Utilities, and Interchange (glTF import on UE 5.8+).
 
 ## Quick start
 
@@ -116,6 +124,19 @@ See [`.env.example`](.env.example) for the full supported configuration. The mod
 5. Inspect partial artifacts while a job runs. If a job is interrupted, use restart or resume; a child job retains its lineage and immutable source job.
 6. For vehicle assets, mark/suggest wheels in the **Rig** tab and create a rigged child job. Auto-suggest begins with four conventional wheel markers; add and place markers for additional axles (up to 16 wheels). Download the Unity package when validation passes.
 
+## Engine packages
+
+Completed jobs produce engine-targeted ZIP packages as downloadable artifacts.
+
+- `unity-package.zip` — extract into a Unity project's `Assets/` folder (or import the GLBs directly). Rigged vehicles include an editor script under **HunyForge > Setup Vehicle Colliders**.
+- `unreal-package.zip` — opt in per job via the **Unreal package** toggle on the Generate form, then install into an Unreal project with the bootstrap script:
+
+```powershell
+.\scripts\setup-unreal.ps1 -ProjectPath D:\path\to\Game.uproject -PackageZip .\unreal-package.zip
+```
+
+The script resolves the UE install, enables the required plugins in the `.uproject` (backed up to `.uproject.hunyforge-bak`), runs the packaged Python setup headless — import, LOD chain, collision — and prints a JSON result report listing anything that remains manual. Run it with no arguments to probe an engine's capabilities without a project. For rigged vehicles the package preserves the `Chassis`/`Wheel_*` hierarchy and Chaos parameter hints in the manifest; assembling a Chaos vehicle pawn remains a documented manual step.
+
 ## Validation and checks
 
 ```powershell
@@ -123,7 +144,7 @@ npm run lint
 npm test
 npm run build
 python -m compileall backend
-python -m unittest backend.test_pipeline backend.test_api
+python -m unittest discover -s backend -t .
 
 # Requires a running API in demo mode.
 .\scripts\verify-demo.ps1

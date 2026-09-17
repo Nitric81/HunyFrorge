@@ -224,6 +224,7 @@ class JobStatus(BaseModel):
     t2i_model: str | None = None
     asset_type: Literal["generic", "character", "vehicle"] = "generic"
     rig_spec: VehicleRigSpec | None = None
+    unreal_export: bool = False
     model_revision: str = ""
     runtime_config: dict[str, Any] = Field(default_factory=dict)
     stage_status: dict[str, StageState] = Field(default_factory=lambda: {name: StageState() for name in PIPELINE_STAGES})
@@ -257,6 +258,7 @@ class JobCreate(BaseModel):
     prompt: str | None = Field(default=None, max_length=2000)
     t2i_seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
     asset_type: Literal["generic", "character", "vehicle"] = "generic"
+    unreal_export: bool = False
     parameters: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")

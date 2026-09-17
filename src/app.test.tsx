@@ -768,4 +768,71 @@ describe('App', () => {
     const badges = Array.from(container.querySelectorAll('.input-badge')).map(el => el.textContent);
     expect(badges).toContain('RIG');
   });
+
+  it('sends unreal_export when the Unreal package toggle is enabled', async () => {
+    route('POST', /\/api\/jobs$/, body => {
+      const created = jobFixture({ id: 'job-unreal', unreal_export: true });
+      jobsById['job-unreal'] = created;
+      return { status: 202, body: created };
+    });
+    await mount();
+    await act(async () => {
+      (field('Unreal package') as HTMLInputElement).click();
+    });
+    await submitForm();
+    expect(postJobs()).toHaveLength(1);
+    expect((postJobs()[0].body as Record<string, unknown>).unreal_export).toBe(true);
+  });
+
+  it('defaults unreal_export to false when the toggle is untouched', async () => {
+    route('POST', /\/api\/jobs$/, body => {
+      const created = jobFixture({ id: 'job-plain' });
+      jobsById['job-plain'] = created;
+      return { status: 202, body: created };
+    });
+    await mount();
+    await submitForm();
+    expect(postJobs()).toHaveLength(1);
+    expect((postJobs()[0].body as Record<string, unknown>).unreal_export).toBe(false);
+  });
+
+  it('shows the Unreal validation row and package download for unreal jobs', async () => {
+    const job = jobFixture({
+      id: 'job-unreal',
+      stage: 'complete',
+      progress: 100,
+      unreal_export: true,
+      artifact_readiness: { 'unity-package.zip': true, 'unreal-package.zip': true },
+      artifacts: ['artifacts/unity-package.zip', 'artifacts/unreal-package.zip'],
+      stage_status: { shape: stageRecord('complete'), texture: stageRecord('complete'), unity: stageRecord('complete'), validation: stageRecord('complete') },
+    });
+    jobsById[job.id] = job;
+    listedJobs = [job];
+    window.localStorage.setItem('hunyforge.selectedJob', job.id);
+    route('GET', /\/api\/jobs\/[^/]+\/validation$/, () => ({ body: { status: 'passed', unreal_ready: true, checks: { unreal: ['unreal-lod0.glb-present'] } } }));
+    await mount();
+    await act(async () => { buttonWith('Engine export').click(); });
+    expect(container.textContent).toContain('Unreal export validation');
+    const link = Array.from(container.querySelectorAll('a')).find(el => el.textContent?.includes('Export Unreal package'));
+    expect(link?.getAttribute('href')).toContain('unreal-package.zip');
+  });
+
+  it('hides the Unreal section for jobs without unreal_export', async () => {
+    const job = jobFixture({
+      id: 'job-unity-only',
+      stage: 'complete',
+      progress: 100,
+      artifact_readiness: { 'unity-package.zip': true },
+      artifacts: ['artifacts/unity-package.zip'],
+      stage_status: { shape: stageRecord('complete'), texture: stageRecord('complete'), unity: stageRecord('complete'), validation: stageRecord('complete') },
+    });
+    jobsById[job.id] = job;
+    listedJobs = [job];
+    window.localStorage.setItem('hunyforge.selectedJob', job.id);
+    route('GET', /\/api\/jobs\/[^/]+\/validation$/, () => ({ body: { status: 'passed', unreal_ready: null, checks: { unreal: [] } } }));
+    await mount();
+    await act(async () => { buttonWith('Engine export').click(); });
+    expect(container.textContent).not.toContain('Unreal export validation');
+    expect(container.textContent).not.toContain('Export Unreal package');
+  });
 });
