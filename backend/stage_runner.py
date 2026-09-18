@@ -3,7 +3,7 @@
 Runs one worker stage in a fresh interpreter so process exit returns all model
 RSS (anonymous heap, CUDA host caches, native arenas) to the kernel. The
 long-lived uvicorn supervisor in backend.hunyuan_worker spawns one of these
-per request instead of running stages in-process; see OOM-ISSUES.md.
+per request instead of running stages in-process.
 """
 import argparse
 import json

@@ -165,5 +165,5 @@ The current implementation has real target-GPU evidence for text/image generatio
 - **Multi-view is unavailable:** start the `multiview` Compose profile and confirm `/health` reports `multi_view.enabled: true`.
 - **A real job is rejected as not ready:** wait for `runtime_ready: true`; model initialization may take several minutes after a container rebuild.
 - **GPU out of memory:** do not run competing GPU jobs. Keep the staged 1024 render / 2048 texture profile for the tested 16 GB target unless you have validated another profile.
-- **`insufficient_memory` or `WORKER_OOM_KILLED` job errors:** stages run in isolated subprocesses so the failure is contained to that stage (the container stays up). Check `workers.hunyuan.memory` in `/health` for headroom, wait for it to recover, then resubmit — see `OOM-ISSUES.md`.
+- **`insufficient_memory` or `WORKER_OOM_KILLED` job errors:** stages run in isolated subprocesses so the failure is contained to that stage (the container stays up). Check `workers.hunyuan.memory` in `/health` for headroom, wait for it to recover, then resubmit.
 - **Job connection is degraded:** the UI falls back from SSE to status polling. Refreshing the browser should recover persisted job state.
