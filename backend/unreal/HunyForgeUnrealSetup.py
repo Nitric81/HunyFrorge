@@ -218,7 +218,12 @@ def _find_sources(source_dir: Path) -> dict:
         return None
     files["lod1"] = pick("lod1", "_lod1")
     files["collision"] = pick("collision", "ucx_", "ubx_")
-    files["lod0"] = pick("lod0", "_lod0", "sm_", "textured", "rigged") or (glbs[0] if glbs else None)
+    # "sm_" would false-match "Collision_SM_*" (sorted first), so prefer explicit
+    # LOD0 names and otherwise take the first GLB not already claimed above.
+    files["lod0"] = pick("lod0", "_lod0", "textured", "rigged") or next(
+        (glb for glb in glbs if glb not in (files["lod1"], files["collision"])),
+        glbs[0] if glbs else None,
+    )
     return files
 
 
