@@ -554,8 +554,12 @@ class Pipeline:
     def _fail(self, job: JobStatus, exc: Exception) -> None:
         message = str(exc)
         lowered = message.lower()
-        if "out of memory" in lowered:
+        if "worker_oom_killed" in lowered:
+            code = "WORKER_OOM_KILLED"
+        elif "out of memory" in lowered:
             code = "CUDA_OUT_OF_MEMORY"
+        elif "insufficient_memory" in lowered:
+            code = "INSUFFICIENT_MEMORY"
         elif "unavailable" in lowered or "still loading" in lowered:
             code = "WORKER_UNAVAILABLE"
         else:

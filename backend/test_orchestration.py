@@ -633,6 +633,19 @@ class StageFlowTests(unittest.TestCase):
                 result2 = run_job(store, job2, adapter=adapter)
             self.assertEqual(result2.error_code, "WORKER_UNAVAILABLE")
 
+    def test_error_codes_distinguish_worker_oom_and_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = JobStore(Path(directory))
+            adapter = RecordingAdapter()
+            job = JobStatus(backend="demo")
+            with patch.object(RecordingAdapter, "generate_shape", lambda self, s, p, o: (_ for _ in ()).throw(RuntimeError("Hunyuan service returned HTTP 503: worker_oom_killed: stage process was SIGKILLed"))):
+                result = run_job(store, job, adapter=adapter)
+            self.assertEqual(result.error_code, "WORKER_OOM_KILLED")
+            job2 = JobStatus(backend="demo")
+            with patch.object(RecordingAdapter, "generate_shape", lambda self, s, p, o: (_ for _ in ()).throw(RuntimeError("Hunyuan service returned HTTP 503: insufficient_memory: 100MiB available < 12288MiB required"))):
+                result2 = run_job(store, job2, adapter=adapter)
+            self.assertEqual(result2.error_code, "INSUFFICIENT_MEMORY")
+
     def test_lod0_preserves_source_bytes_and_zip_includes_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             store = JobStore(Path(directory))

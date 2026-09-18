@@ -322,6 +322,8 @@ class WorkerTests(unittest.TestCase):
             "HUNYUAN_FLASHVDM": "0",
             "HUNYUAN_COMPILE": "0",
             "HUNYUAN_DINO_DEVICE": "cpu",
+            "HUNYFORGE_STAGE_ISOLATION": "0",
+            "HUNYFORGE_MIN_AVAILABLE_MB": "0",
         }.items():
             cls.old_env[k] = os.environ.get(k)
             os.environ[k] = v
@@ -858,6 +860,8 @@ class PreviewTests(unittest.TestCase):
             "HUNYFORGE_T2I_ENABLED": "1",
             "HUNYFORGE_T2I_MODEL_PATH": str(cls.t2i_path),
             "HUNYUAN_CPU_THREADS": "8",
+            "HUNYFORGE_STAGE_ISOLATION": "0",
+            "HUNYFORGE_MIN_AVAILABLE_MB": "0",
         }.items():
             cls.old_env[k] = os.environ.get(k)
             os.environ[k] = v

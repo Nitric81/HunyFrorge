@@ -112,6 +112,8 @@ Copy `.env.example` to a local `.env` file or set equivalent environment variabl
 | `HUNYFORGE_MULTI_VIEW_URL` | Internal URL for the 2mv worker | `http://hunyforge-multiview:8083` |
 | `HUNYUAN2MV_MODEL_HOST_PATH` | Host directory containing Hunyuan3D-2mv weights | Local model directory |
 | `HUNYUAN2MV_SUBFOLDER` | 2mv checkpoint variant | `hunyuan3d-dit-v2-mv-turbo` |
+| `HUNYFORGE_STAGE_ISOLATION` | Run each stage in a fresh subprocess so the OS reclaims model RSS on exit | `1` |
+| `HUNYFORGE_MIN_AVAILABLE_MB` | Reject a stage with `insufficient_memory` below this VM headroom | `12288` |
 
 See [`.env.example`](.env.example) for the full supported configuration. The model directory mounted into Docker is read-only; job history and output artifacts are persisted in the `hunyforge-data` Docker volume.
 
@@ -163,4 +165,5 @@ The current implementation has real target-GPU evidence for text/image generatio
 - **Multi-view is unavailable:** start the `multiview` Compose profile and confirm `/health` reports `multi_view.enabled: true`.
 - **A real job is rejected as not ready:** wait for `runtime_ready: true`; model initialization may take several minutes after a container rebuild.
 - **GPU out of memory:** do not run competing GPU jobs. Keep the staged 1024 render / 2048 texture profile for the tested 16 GB target unless you have validated another profile.
+- **`insufficient_memory` or `WORKER_OOM_KILLED` job errors:** stages run in isolated subprocesses so the failure is contained to that stage (the container stays up). Check `workers.hunyuan.memory` in `/health` for headroom, wait for it to recover, then resubmit — see `OOM-ISSUES.md`.
 - **Job connection is degraded:** the UI falls back from SSE to status polling. Refreshing the browser should recover persisted job state.

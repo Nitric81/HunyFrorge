@@ -1,4 +1,5 @@
 import base64
+import ctypes
 import gc
 import json
 import logging
@@ -12,7 +13,7 @@ from uuid import UUID, uuid4
 
 from .models import DEFAULT_MODEL_REVISION, DEFAULT_SOURCE_REVISION, GenerationSettings, JobStatus, current_runtime_config
 from .storage import sha256_file
-from .telemetry import StageTelemetry
+from .telemetry import StageTelemetry, rss_mb
 
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,34 @@ def _is_path_within(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def memory_snapshot() -> dict:
+    """Process RSS plus VM headroom; available/total only on Linux."""
+    snap = {}
+    rss = rss_mb()
+    if rss is not None:
+        snap["rss_mb"] = int(rss)
+    try:
+        meminfo = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            key, _, rest = line.partition(":")
+            fields = rest.split()
+            if fields:
+                meminfo[key] = int(fields[0])
+        snap["available_mb"] = meminfo.get("MemAvailable", 0) // 1024
+        snap["total_mb"] = meminfo.get("MemTotal", 0) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return snap
+
+
+def _malloc_trim() -> None:
+    """Return free glibc arena pages to the kernel; no-op elsewhere."""
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
 
 
 class _TimedModelProxy:
@@ -182,6 +211,7 @@ class RuntimeEngine:
             "active_job_id": self.active_job_id,
             "runtime_config": current_runtime_config(),
             "last_error": self.error or ready_error,
+            "memory": memory_snapshot(),
         }
 
     def _raw_base64(self, value: str) -> str:
@@ -309,12 +339,13 @@ class RuntimeEngine:
         gc.collect()
         try:
             torch = self._get_dep("torch")
+            if hasattr(torch, "cuda") and torch.cuda.is_available():
+                if torch.cuda.is_initialized():
+                    torch.cuda.synchronize()
+                torch.cuda.empty_cache()
         except Exception:
-            return
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            if torch.cuda.is_initialized():
-                torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+            pass
+        _malloc_trim()
 
     def _instrument_paint_pipeline(self, pipeline, meter):
         vp = pipeline.view_processor

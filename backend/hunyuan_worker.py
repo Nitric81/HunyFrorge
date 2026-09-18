@@ -1,6 +1,11 @@
 import asyncio
 import base64
+import json
 import os
+import shutil
+import signal
+import sys
+import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -9,9 +14,10 @@ from uuid import UUID
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from starlette.background import BackgroundTask
 
 from .models import GenerationSettings
-from .worker_runtime import RuntimeEngine
+from .worker_runtime import RuntimeEngine, memory_snapshot
 
 
 class MeshToken(BaseModel):
@@ -52,6 +58,25 @@ class PreviewRequest(BaseModel):
     num_inference_steps: int = Field(default=4, ge=1, le=28)
 
 
+def stage_isolation_enabled() -> bool:
+    """Run each stage in a fresh subprocess so exit reclaims all model RSS."""
+    return os.getenv("HUNYFORGE_STAGE_ISOLATION", "1") == "1"
+
+
+def admission_error() -> str | None:
+    """Reject work when the VM lacks headroom instead of OOMing mid-stage."""
+    try:
+        required = int(os.getenv("HUNYFORGE_MIN_AVAILABLE_MB", "12288"))
+    except ValueError:
+        required = 12288
+    if required <= 0:
+        return None
+    available = memory_snapshot().get("available_mb")
+    if available is not None and available < required:
+        return f"insufficient_memory: {available}MiB available < {required}MiB required (HUNYFORGE_MIN_AVAILABLE_MB)"
+    return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
@@ -67,10 +92,86 @@ def get_engine() -> RuntimeEngine:
     return app.state.engine
 
 
+_STAGE_ERROR_TYPES = {"ValueError": ValueError, "MemoryError": MemoryError}
+
+
+def _stage_error(result: dict) -> Exception:
+    message = result.get("error") or "stage failed"
+    exc_type = _STAGE_ERROR_TYPES.get(result.get("error_type"), RuntimeError)
+    return exc_type(message)
+
+
+async def _spawn_and_collect(kind: str, payload: dict, slot: Path) -> dict:
+    request_path = slot / "request.json"
+    result_path = slot / "result.json"
+    request_path.write_text(json.dumps({"kind": kind, "payload": payload}), encoding="utf-8")
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "backend.stage_runner",
+        "--request", str(request_path), "--result", str(result_path),
+        stderr=asyncio.subprocess.PIPE,
+    )
+    app.state.active_stage = {"pid": proc.pid, "kind": kind}
+    try:
+        _, stderr = await proc.communicate()
+    except asyncio.CancelledError:
+        if proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                proc.kill()
+                await proc.wait()
+        raise
+    finally:
+        app.state.active_stage = None
+    result = None
+    if result_path.is_file():
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            result = None
+    if result and result.get("status") == "ok":
+        return result
+    if result and result.get("status") == "error":
+        raise _stage_error(result)
+    tail = (stderr or b"").decode("utf-8", errors="replace")[-1500:].strip()
+    if proc.returncode == -getattr(signal, "SIGKILL", 9):
+        raise RuntimeError(f"worker_oom_killed: stage process was SIGKILLed (kernel OOM killer); check docker logs for the Killed line")
+    raise RuntimeError(f"stage process exited with code {proc.returncode}: {tail or 'no stderr captured'}")
+
+
+async def _isolated_stage(kind: str, payload: dict) -> tuple[dict, Path]:
+    slot = Path(tempfile.mkdtemp(prefix=f"hunyforge-{kind}-"))
+    try:
+        return await _spawn_and_collect(kind, payload, slot), slot
+    except BaseException:
+        shutil.rmtree(slot, ignore_errors=True)
+        raise
+
+
+def _map_stage_exception(e: Exception):
+    if isinstance(e, ValueError):
+        return HTTPException(status_code=422, detail=str(e))
+    msg = str(e)
+    lowered = msg.lower()
+    if isinstance(e, MemoryError) or "out of memory" in lowered or "worker_oom_killed" in lowered:
+        return HTTPException(status_code=503, detail=msg or "Worker out of memory")
+    return HTTPException(status_code=500, detail=msg)
+
+
 @app.get("/health")
 async def health():
     engine = get_engine()
     status = await asyncio.to_thread(engine.health)
+    status["memory"] = await asyncio.to_thread(memory_snapshot)
+    status["stage_isolation"] = stage_isolation_enabled()
+    status["busy"] = status["busy"] or engine._worker_lock.locked()
+    active = getattr(app.state, "active_stage", None)
+    if active:
+        status["active_stage"] = active
     if status["ready"]:
         return JSONResponse(content=status)
     raise HTTPException(status_code=503, detail=status)
@@ -83,6 +184,15 @@ async def generate(request: WorkerRequest):
         raise HTTPException(status_code=409, detail="Worker busy")
     task = None
     try:
+        reason = admission_error()
+        if reason:
+            raise HTTPException(status_code=503, detail=reason)
+        if stage_isolation_enabled():
+            result, slot = await _isolated_stage("generate", request.model_dump(mode="json"))
+            artifact = Path(result["artifact"])
+            if not artifact.is_file():
+                raise RuntimeError(f"stage artifact missing: {artifact}")
+            return FileResponse(artifact, filename=artifact.name, media_type="model/gltf-binary", background=BackgroundTask(shutil.rmtree, slot, ignore_errors=True))
         task = asyncio.ensure_future(asyncio.to_thread(engine.generate, request))
         shielded = asyncio.shield(task)
         result = await shielded
@@ -94,13 +204,10 @@ async def generate(request: WorkerRequest):
             except Exception:
                 pass
         raise
-    except RuntimeError as e:
-        msg = str(e)
-        if "out of memory" in msg.lower():
-            raise HTTPException(status_code=503, detail="GPU out of memory; reduce settings or wait.") from e
-        raise HTTPException(status_code=500, detail=msg) from e
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except (ValueError, RuntimeError, MemoryError) as e:
+        raise _map_stage_exception(e) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     finally:
@@ -115,6 +222,16 @@ async def preview(request: PreviewRequest):
         raise HTTPException(status_code=409, detail="Worker busy")
     task = None
     try:
+        reason = admission_error()
+        if reason:
+            raise HTTPException(status_code=503, detail=reason)
+        if stage_isolation_enabled():
+            result, slot = await _isolated_stage("preview", request.model_dump(mode="json"))
+            artifact = Path(result["artifact"])
+            png = await asyncio.to_thread(artifact.read_bytes)
+            timings = result.get("timings", {})
+            content = {"image": "data:image/png;base64," + base64.b64encode(png).decode("ascii"), "timings": timings}
+            return JSONResponse(content=content, background=BackgroundTask(shutil.rmtree, slot, ignore_errors=True))
         task = asyncio.ensure_future(asyncio.to_thread(engine.generate_preview, request))
         png, records = await asyncio.shield(task)
         timings = {name: round(record.get("elapsed_seconds") or 0, 2) for name, record in records.items()}
@@ -126,13 +243,10 @@ async def preview(request: PreviewRequest):
             except Exception:
                 pass
         raise
-    except RuntimeError as e:
-        msg = str(e)
-        if "out of memory" in msg.lower():
-            raise HTTPException(status_code=503, detail="GPU out of memory; wait for the active job to finish and retry.") from e
-        raise HTTPException(status_code=500, detail=msg) from e
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except (ValueError, RuntimeError, MemoryError) as e:
+        raise _map_stage_exception(e) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     finally:
