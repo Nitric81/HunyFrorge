@@ -15,10 +15,17 @@ It combines a React/Three.js UI with a FastAPI job service and local CUDA infere
 
 ## Requirements
 
-- Windows with Docker Desktop and an NVIDIA GPU configured for Docker GPU workloads.
-- NVIDIA RTX 4080 (16 GB VRAM) is the tested target. Shape and texture run as separate stages to fit that budget.
-- Node.js and Python for the developer workflow; Docker is the recommended real-inference workflow.
-- Local model snapshots:
+### Hardware
+
+- **NVIDIA GPU with CUDA support.** The tested target is an RTX 4080 (16 GB VRAM); shape and texture run as separate stages to fit that budget. Smaller GPUs may work at lower presets but are unvalidated. AMD/ROCm is not supported.
+- **~24 GB+ system RAM.** The worker admission gate rejects a stage when less than `HUNYFORGE_MIN_AVAILABLE_MB` (default 12 GB) is free.
+- **Disk:** plan for tens of GB of model snapshots (the 2.1 weights alone are ~15 GB; FLUX and 2mv add more) plus a Docker volume for job artifacts.
+
+### Software
+
+- Windows 11 with Docker Desktop on WSL2 and the NVIDIA Container Toolkit configured for GPU workloads. This is the verified path; native Linux with the NVIDIA Container Toolkit should work but is untested.
+- Node.js 22+ and Python 3.10+ for the developer workflow; Docker is the recommended real-inference workflow.
+- Local model snapshots (download separately — see [Licenses](#licenses)):
   - Hunyuan3D-2.1 for image shape generation and PBR texturing.
   - Hunyuan3D-2mv Turbo for native multi-view shape generation (optional unless using Multi view).
   - FLUX.2-klein-4B for text-to-3D and reference-preview features (optional unless using Text).
@@ -30,6 +37,14 @@ Engine installs are only needed to consume export packages; HunyForge runs witho
 - **Unity Editor** — imports `unity-package.zip` (GLB via the glTFast importer). Verified on Unity 6000.5.8f1 with glTFast 6.20.0; see `unity-smoke-test/`.
 - **Unreal Engine 5.x** — imports `unreal-package.zip` (GLB via the Interchange pipeline). Verified on UE 5.8.2. The engine is auto-detected from the registry and `UE_*` install folders on any drive, or pass `-EnginePath`.
   - Required plugins are enabled automatically by the bootstrap script: Python Editor Script Plugin, Editor Scripting Utilities, and Interchange (glTF import on UE 5.8+).
+
+## Security and privacy
+
+HunyForge is a **single-user local tool**. The API has no authentication and no rate limiting; it is only safe because the stack binds to `127.0.0.1`.
+
+- **Do not expose the service.** Do not publish port 8081/8082/8083 on `0.0.0.0`, a LAN interface, or behind a reverse proxy without adding your own authentication layer. Anyone who can reach the API can submit GPU jobs, create projects, and read or cancel jobs.
+- **Local-first by default.** Input images, models, job data, and artifacts stay on your machine; `HF_HUB_OFFLINE=1` and Hugging Face telemetry is disabled in the container.
+- **Report vulnerabilities privately** — see [SECURITY.md](SECURITY.md).
 
 ## Quick start
 
@@ -114,17 +129,32 @@ Copy `.env.example` to a local `.env` file or set equivalent environment variabl
 | `HUNYUAN2MV_SUBFOLDER` | 2mv checkpoint variant | `hunyuan3d-dit-v2-mv-turbo` |
 | `HUNYFORGE_STAGE_ISOLATION` | Run each stage in a fresh subprocess so the OS reclaims model RSS on exit | `1` |
 | `HUNYFORGE_MIN_AVAILABLE_MB` | Reject a stage with `insufficient_memory` below this VM headroom | `12288` |
+| `HUNYFORGE_JOB_MAX_AGE_DAYS` | Seed default: auto-delete completed jobs older than this | `0` (keep forever) |
+| `HUNYFORGE_FAILED_JOB_MAX_AGE_DAYS` | Seed default: auto-delete failed/cancelled jobs older than this | `0` (keep forever) |
+| `HUNYFORGE_DATA_MAX_GB` | Seed default: data-volume cap; oldest terminal jobs evicted first | `0` (unlimited) |
+
+### Settings screen
+
+Open **Settings** via the gear icon in the sidebar header. It covers:
+
+- **Storage** — retention limits (completed-job age, failed/cancelled-job age, total disk cap), current disk usage, and a "Clean up now" sweep.
+- **Generation defaults** — default quality preset and default Unreal-package opt-in.
+- **Runtime** — memory admission threshold and stage isolation (applies to the next stage, not one in flight).
+- **About** — version, inference mode, runtime/GPU status.
+
+UI-editable values persist in `settings.json` under the data root and **win over the env seeds** above once saved; infra config (model paths, URLs, ports) remains env-only. Retention only ever deletes terminal (complete/failed/cancelled) jobs — a running job is never touched — and individual jobs can be deleted from the history list.
 
 See [`.env.example`](.env.example) for the full supported configuration. The model directory mounted into Docker is read-only; job history and output artifacts are persisted in the `hunyforge-data` Docker volume.
 
 ## Working in the UI
 
-1. Choose **Image** or **Text**, then select the asset type: Generic, Character, or Vehicle.
+1. Choose **Image** or **Text**, then select the asset type: Generic, Character, Vehicle, or Vegetation.
 2. For image input, upload one image or select Multi view and add its required labeled references.
 3. Select a quality preset. HunyForge resolves it into inference settings and records the result with the job.
 4. Generate. Shape, texture, Unity preparation, validation, and vehicle rigging progress are streamed to the UI.
 5. Inspect partial artifacts while a job runs. If a job is interrupted, use restart or resume; a child job retains its lineage and immutable source job.
 6. For vehicle assets, mark/suggest wheels in the **Rig** tab and create a rigged child job. Auto-suggest begins with four conventional wheel markers; add and place markers for additional axles (up to 16 wheels). Download the Unity package when validation passes.
+7. For vegetation assets (trees and large plants), the Unreal package additionally carries wind vertex colors (`COLOR_0`: R = sway weight, G = normalized height), a trunk-only collision capsule when `collision_mode` is `trunk`, and a FLUX-generated leaf-spray atlas (`T_Leaf_*.png`). The packaged setup script applies two-sided foliage materials with vertex-color-weighted wind.
 
 ## Engine packages
 
@@ -159,6 +189,14 @@ The current implementation has real target-GPU evidence for text/image generatio
 - [Product and technical design](docs/HUNYFORGE_DESIGN.md)
 - [Verification ledger](docs/VERIFICATION.md)
 - [Current delivery status](STATUS.md)
+
+## Licenses
+
+HunyForge's own source code is [Apache-2.0](LICENSE). **Model weights are not included** — you download each snapshot yourself, and each is governed by its own license. Review the model cards before use, especially for commercial use:
+
+- **Hunyuan3D-2.1** and **Hunyuan3D-2mv** (`tencent/*` on Hugging Face) — Tencent Hunyuan Community License, which includes usage restrictions.
+- **FLUX.2-klein-4B** (Black Forest Labs) — distributed under its own terms; check the model card.
+- **RealESRGAN** (bundled in the Hunyuan3D texture pipeline) — BSD-3-Clause.
 
 ## Troubleshooting
 

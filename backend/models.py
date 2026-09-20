@@ -60,8 +60,9 @@ class GenerationSettings(BaseModel):
     face_count: int = Field(ge=1000, le=100000)
     generate_lods: bool
     generate_collision: bool
-    collision_mode: Literal["box", "convex_hull"]
+    collision_mode: Literal["box", "convex_hull", "trunk"]
     unity_mode: Literal["fast", "full"]
+    target_height_m: float | None = Field(default=None, ge=0.5, le=100)
 
     @model_validator(mode="after")
     def validate_combinations(self):
@@ -137,6 +138,38 @@ def t2i_config() -> dict:
 def scaffold_prompt(prompt: str, edit: bool = False) -> str:
     suffix = T2I_SCAFFOLD_EDIT if edit else T2I_SCAFFOLD_GENERATE
     return f"{prompt.strip()}, {suffix}"
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+class AppSettings(BaseModel):
+    """User-editable settings persisted as settings.json under the data root.
+
+    Field defaults seed from environment variables, so an untouched install
+    behaves exactly like the env-only configuration. Once settings.json exists
+    it wins over the environment; infra settings (model paths, URLs, ports)
+    remain env-only and are not represented here.
+    """
+
+    job_max_age_days: int = Field(default_factory=lambda: _env_int("HUNYFORGE_JOB_MAX_AGE_DAYS", 0), ge=0)
+    failed_job_max_age_days: int = Field(default_factory=lambda: _env_int("HUNYFORGE_FAILED_JOB_MAX_AGE_DAYS", 0), ge=0)
+    data_max_gb: float = Field(default_factory=lambda: _env_float("HUNYFORGE_DATA_MAX_GB", 0.0), ge=0)
+    default_preset: str | None = None
+    default_unreal_export: bool = False
+    min_available_mb: int = Field(default_factory=lambda: _env_int("HUNYFORGE_MIN_AVAILABLE_MB", 12288), ge=0)
+    stage_isolation: bool = Field(default_factory=lambda: os.getenv("HUNYFORGE_STAGE_ISOLATION", "1") == "1")
 
 
 class StageState(BaseModel):
@@ -222,7 +255,7 @@ class JobStatus(BaseModel):
     prompt: str | None = None
     t2i_seed: int | None = None
     t2i_model: str | None = None
-    asset_type: Literal["generic", "character", "vehicle"] = "generic"
+    asset_type: Literal["generic", "character", "vehicle", "vegetation"] = "generic"
     rig_spec: VehicleRigSpec | None = None
     unreal_export: bool = False
     model_revision: str = ""
@@ -257,7 +290,7 @@ class JobCreate(BaseModel):
     input_mode: Literal["image", "multi-image", "text", "retexture", "vehicle-rig"] = "image"
     prompt: str | None = Field(default=None, max_length=2000)
     t2i_seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
-    asset_type: Literal["generic", "character", "vehicle"] = "generic"
+    asset_type: Literal["generic", "character", "vehicle", "vegetation"] = "generic"
     unreal_export: bool = False
     parameters: dict[str, Any] = Field(default_factory=dict)
 

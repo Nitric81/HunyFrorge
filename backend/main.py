@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import time
 import urllib.error
@@ -15,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from .models import (
+    AppSettings,
     GenerationSettings,
     HealthResponse,
     JobCreate,
@@ -23,6 +25,7 @@ from .models import (
     Project,
     ProjectCreate,
     VehicleRigSpec,
+    TERMINAL_STAGES,
     current_model_revision,
     current_runtime_config,
     load_generation_presets,
@@ -32,11 +35,15 @@ from .models import (
 )
 import json
 from .pipeline import Pipeline
-from .storage import JobStore
+from .retention import sweep_jobs
+from .storage import JobStore, SettingsStore
 from . import vehicle_rig
+
+logger = logging.getLogger(__name__)
 
 ROOT = Path(os.getenv("HUNYFORGE_DATA_ROOT", Path.cwd() / "data"))
 store = JobStore(ROOT)
+settings_store = SettingsStore(ROOT)
 pipeline = Pipeline(store)
 app = FastAPI(title="HunyForge API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174", "http://localhost:4173", "http://127.0.0.1:4173"], allow_methods=["*"], allow_headers=["*"])
@@ -45,6 +52,21 @@ app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http
 @app.on_event("startup")
 async def recover_interrupted_jobs() -> None:
     store.recover_incomplete_jobs()
+
+
+@app.on_event("startup")
+async def start_retention_sweeper() -> None:
+    async def _loop() -> None:
+        while True:
+            try:
+                report = await asyncio.to_thread(sweep_jobs, store, settings_store.load())
+                if report["deleted_jobs"] or report["tmp_files_removed"] or report["slot_dirs_removed"]:
+                    logger.info("retention sweep: %s", report)
+            except Exception:
+                logger.exception("retention sweep failed")
+            await asyncio.sleep(3600)
+
+    app.state.retention_sweeper = asyncio.create_task(_loop())
 
 DIST_ROOT = Path(__file__).resolve().parent.parent / "dist"
 if DIST_ROOT.is_dir():
@@ -511,3 +533,36 @@ async def artifact(job_id: UUID, artifact_name: str) -> FileResponse:
     if store.path(job_id).resolve() not in target.parents or not target.is_file():
         raise HTTPException(status_code=404, detail="Artifact not found")
     return FileResponse(target)
+
+
+async def _settings_payload() -> dict:
+    return {"settings": settings_store.load().model_dump(mode="json"), "usage": await asyncio.to_thread(store.disk_usage)}
+
+
+@app.get("/api/settings")
+async def get_settings() -> dict:
+    return await _settings_payload()
+
+
+@app.put("/api/settings")
+async def put_settings(payload: AppSettings) -> dict:
+    presets = load_generation_presets().get("presets", {})
+    if payload.default_preset is not None and payload.default_preset not in presets:
+        raise HTTPException(status_code=422, detail=f"Unknown preset: {payload.default_preset}")
+    settings_store.save(payload)
+    return await _settings_payload()
+
+
+@app.post("/api/settings/sweep")
+async def sweep_now() -> dict:
+    return await asyncio.to_thread(sweep_jobs, store, settings_store.load())
+
+
+@app.delete("/api/jobs/{job_id}", status_code=204)
+async def delete_job(job_id: UUID) -> None:
+    job = store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.stage not in TERMINAL_STAGES:
+        raise HTTPException(status_code=409, detail="Only terminal jobs can be deleted")
+    store.delete_job(job_id)

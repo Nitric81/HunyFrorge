@@ -1,10 +1,12 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
-import { Ban, Box, CheckCircle2, ChevronDown, Download, FolderOpen, Gauge, ImagePlus, Layers3, LoaderCircle, Menu, Pencil, Play, RefreshCw, RotateCcw, ShieldCheck, Sparkles, Type, Upload, X, XCircle } from 'lucide-react';
+import { Ban, Box, CheckCircle2, ChevronDown, Download, FolderOpen, Gauge, ImagePlus, Layers3, LoaderCircle, Menu, Pencil, Play, RefreshCw, RotateCcw, Settings, ShieldCheck, Sparkles, Trash2, TreePine, Type, Upload, X, XCircle } from 'lucide-react';
 import {
+  AppSettings,
   AssetType,
   BackendId,
   ConnectionState,
   GenerationSettings,
+  HealthInfo,
   JobPayload,
   JobUpdate,
   PresetContract,
@@ -22,11 +24,13 @@ import {
   artifactUrl,
   controlFileError,
   createProject,
+  deleteJob,
   describeError,
   fetchHealth,
   fetchJob,
   fetchJobs,
   fetchPresets,
+  fetchSettings,
   fetchProjects,
   fetchValidation,
   formatElapsed,
@@ -50,6 +54,7 @@ import {
   watchJob,
 } from './job-utils';
 import type { MeshStats, ThreePreviewHandle, ViewerMode } from './ThreePreview';
+import { SettingsPanel } from './SettingsPanel';
 
 const ThreePreview = lazy(() => import('./ThreePreview'));
 const SELECTED_JOB_KEY = 'hunyforge.selectedJob';
@@ -132,6 +137,8 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [connectionState, setConnectionState] = useState<ConnectionState>('live');
   const [runtimeStatus, setRuntimeStatus] = useState('Checking local runtime…');
+  const [health, setHealth] = useState<HealthInfo | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [validationReport, setValidationReport] = useState<ValidationReport | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState('');
@@ -171,6 +178,7 @@ function App() {
   jobIdRef.current = jobId;
 
   function applyHealth(health: Awaited<ReturnType<typeof fetchHealth>>) {
+    setHealth(health);
     setRuntimeStatus(health.inference_mode === 'demo' ? 'Demo runtime · local' : health.runtime_ready ? 'Hunyuan · CUDA ready' : health.hunyuan_service_ready ? 'Hunyuan · setup required' : 'Hunyuan · model loading…');
     const busyNow = Object.values(health.workers ?? {}).some(worker => worker.busy === true);
     setWorkerBusy(busyNow);
@@ -182,12 +190,22 @@ function App() {
     }
   }
 
+  function applyAppSettings(saved: AppSettings, source?: PresetContract | null) {
+    const sourcePresets = source?.presets ?? contract?.presets;
+    setUnrealExport(saved.default_unreal_export);
+    if (saved.default_preset && sourcePresets?.[saved.default_preset]) {
+      setPreset(saved.default_preset);
+      setSettings({ ...sourcePresets[saved.default_preset].settings });
+    }
+  }
+
   useEffect(() => {
     fetchPresets().then(next => {
       setContract(next);
       const initial = (next.presets[next.default] ? next.default : 'standard') as PresetName;
       setPreset(initial);
       setSettings({ ...next.presets[initial].settings });
+      fetchSettings().then(response => applyAppSettings(response.settings, next)).catch(() => undefined);
     }).catch(() => setError('Generation presets unavailable — is the local API running?'));
     fetchHealth().then(applyHealth).catch(() => setRuntimeStatus('API offline'));
     fetchProjects().then(items => { setProjects(items); if (items[0]) setProjectId(current => current || items[0].id); }).catch(() => undefined);
@@ -293,6 +311,21 @@ function App() {
     if (!menuOpen && menuWasOpen.current) menuToggleRef.current?.focus();
     menuWasOpen.current = menuOpen;
   }, [menuOpen, mobile]);
+
+  async function removeJob(id: string) {
+    if (!window.confirm(`Delete job ${id.slice(0, 8)} and all its artifacts? This cannot be undone.`)) return;
+    try {
+      await deleteJob(id);
+      setJobs(current => current.filter(entry => entry.id !== id));
+      if (jobIdRef.current === id) {
+        window.localStorage.removeItem(SELECTED_JOB_KEY);
+        setJobId(null);
+        setJob(null);
+      }
+    } catch (reason) {
+      setError(describeError(reason));
+    }
+  }
 
   function selectJob(entry: JobUpdate) {
     setError(null);
@@ -622,7 +655,7 @@ function App() {
   return <div className="app-shell">
     <a className="skip-link" href="#main-content">Skip to main content</a>
     <aside id="app-sidebar" className={`sidebar ${menuOpen ? 'open' : ''}`} inert={mobile && !menuOpen}>
-      <div className="brand"><div className="brand-mark"><Sparkles size={17} /></div><span>HunyForge</span><button className="icon-button sidebar-close" ref={sidebarCloseRef} aria-label="Close menu" onClick={() => setMenuOpen(false)}><X size={18} /></button></div>
+      <div className="brand"><div className="brand-mark"><Sparkles size={17} /></div><span>HunyForge</span><button className="icon-button settings-gear" aria-label="Open settings" onClick={() => setSettingsOpen(true)}><Settings size={15} /></button><button className="icon-button sidebar-close" ref={sidebarCloseRef} aria-label="Close menu" onClick={() => setMenuOpen(false)}><X size={18} /></button></div>
       <div className="workspace-switcher"><div><span className="eyebrow">PROJECT</span>{projects.length ? <select aria-label="Select project" value={projectId} onChange={event => setProjectId(event.target.value)}>{projects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}</select> : <strong>Asset Lab</strong>}</div><ChevronDown size={15} /></div>
       <nav aria-label="Primary navigation">
         <button className="nav-item active" onClick={refreshHistory}><Layers3 size={17} />Assets <span className="nav-count">{jobs.length}</span></button>
@@ -632,12 +665,17 @@ function App() {
         {jobs.map(entry => {
           const badge = inputModeBadge(entry.input_mode);
           return (
-            <button key={entry.id} className={`history-item ${entry.id === jobId ? 'selected' : ''}`} onClick={() => selectJob(entry)}>
-              <span className={`history-dot ${isTerminalStage(entry.stage) ? entry.stage : 'running'}`} />
-              <span className="history-name">{entry.id.slice(0, 8)}</span>
-              {badge ? <span className={`input-badge ${entry.input_mode}`} title={badge.title}>{badge.label}</span> : null}
-              <span className="history-stage">{STAGE_LABELS[entry.stage] ?? entry.stage}</span>
-            </button>
+            <div key={entry.id} className="history-item-wrap">
+              <button className={`history-item ${entry.id === jobId ? 'selected' : ''}`} onClick={() => selectJob(entry)}>
+                <span className={`history-dot ${isTerminalStage(entry.stage) ? entry.stage : 'running'}`} />
+                <span className="history-name">{entry.id.slice(0, 8)}</span>
+                {badge ? <span className={`input-badge ${entry.input_mode}`} title={badge.title}>{badge.label}</span> : null}
+                <span className="history-stage">{STAGE_LABELS[entry.stage] ?? entry.stage}</span>
+              </button>
+              {isTerminalStage(entry.stage) ? (
+                <button className="history-delete" aria-label={`Delete job ${entry.id.slice(0, 8)}`} title="Delete job and artifacts" onClick={() => void removeJob(entry.id)}><Trash2 size={13} /></button>
+              ) : null}
+            </div>
           );
         })}
         {!jobs.length ? <p className="muted small">No jobs yet — generate an asset.</p> : null}
@@ -714,8 +752,10 @@ function App() {
                 <button type="button" className={assetType === 'generic' ? 'selected' : ''} onClick={() => setAssetType('generic')}><Box size={13} />Generic</button>
                 <button type="button" className={assetType === 'character' ? 'selected' : ''} disabled title="Character rigging lands in a later phase">Character</button>
                 <button type="button" className={assetType === 'vehicle' ? 'selected' : ''} onClick={() => setAssetType('vehicle')} title="Enables wheel marking and WheelCollider export">Vehicle</button>
+                <button type="button" className={assetType === 'vegetation' ? 'selected' : ''} onClick={() => setAssetType('vegetation')} title="Foliage export: wind vertex colors, two-sided material, trunk collision, leaf atlas"><TreePine size={13} />Vegetation</button>
               </div>
               {assetType === 'vehicle' ? <p className="field-hint">After generation, mark wheels in the Rig tab — a rigged child job partitions wheels and emits Unity WheelCollider metadata.</p> : null}
+              {assetType === 'vegetation' ? <p className="field-hint">Vegetation adds wind vertex colors, a trunk-only collision capsule, and a FLUX leaf atlas to the Unreal package. Use collision mode trunk for walkable trees.</p> : null}
               <div className="segmented" role="group" aria-label="Input mode">
                 <button type="button" className={inputMode === 'image' ? 'selected' : ''} onClick={() => setInputMode('image')}><ImagePlus size={13} />Image</button>
                 <button type="button" className={inputMode === 'text' ? 'selected' : ''} disabled={!t2iEnabled} title={t2iEnabled ? 'Generate a reference from a text prompt' : 'Requires the FLUX.2-klein T2I worker'} onClick={() => setInputMode('text')}><Type size={13} />Text</button>
@@ -861,6 +901,7 @@ function App() {
       </section>
     </main>
     {menuOpen && <button className="menu-overlay" onClick={() => setMenuOpen(false)} aria-label="Close menu" />}
+    <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} presets={contract} health={health} onSaved={saved => applyAppSettings(saved)} />
   </div>;
 }
 

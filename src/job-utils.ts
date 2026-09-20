@@ -10,7 +10,7 @@ export const API_URL = import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8081';
 export type BackendId = 'demo' | 'hunyuan3d-2.1' | 'hunyuan3d-omni';
 export type PresetName = 'draft' | 'standard' | 'final';
 export type InputMode = 'image' | 'multi-image' | 'text' | 'retexture' | 'vehicle-rig';
-export type AssetType = 'generic' | 'character' | 'vehicle';
+export type AssetType = 'generic' | 'character' | 'vehicle' | 'vegetation';
 export type ReferenceView = 'front' | 'rear' | 'left' | 'right' | 'front_left' | 'rear_right' | 'top' | 'bottom';
 
 export interface ReferenceImage {
@@ -56,7 +56,7 @@ export interface GenerationSettings {
   face_count: number;
   generate_lods: boolean;
   generate_collision: boolean;
-  collision_mode: 'box' | 'convex_hull';
+  collision_mode: 'box' | 'convex_hull' | 'trunk';
   unity_mode: 'fast' | 'full';
 }
 
@@ -396,6 +396,59 @@ export function rigJob(id: string, spec: VehicleRigSpec): Promise<JobUpdate> {
 
 export function jobAction(id: string, action: 'retry' | 'resume' | 'restart' | 'cancel'): Promise<JobUpdate> {
   return request<JobUpdate>(`/api/jobs/${id}/${action}`, { method: 'POST' });
+}
+
+export async function deleteJob(id: string): Promise<void> {
+  const response = await fetch(`${API_URL}/api/jobs/${id}`, { method: 'DELETE' });
+  if (!response.ok) throw await apiError(response);
+}
+
+export interface AppSettings {
+  job_max_age_days: number;
+  failed_job_max_age_days: number;
+  data_max_gb: number;
+  default_preset: PresetName | null;
+  default_unreal_export: boolean;
+  min_available_mb: number;
+  stage_isolation: boolean;
+}
+
+export interface DiskUsage {
+  total_bytes: number;
+  jobs_bytes: number;
+  projects_bytes: number;
+  job_count: number;
+}
+
+export interface SettingsResponse {
+  settings: AppSettings;
+  usage: DiskUsage;
+}
+
+export interface SweepReport {
+  deleted_jobs: string[];
+  freed_bytes: number;
+  tmp_files_removed: number;
+  slot_dirs_removed: number;
+}
+
+export function fetchSettings(): Promise<SettingsResponse> {
+  return request<SettingsResponse>('/api/settings');
+}
+
+export function saveSettings(settings: AppSettings): Promise<SettingsResponse> {
+  return request<SettingsResponse>('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settings) });
+}
+
+export function sweepStorage(): Promise<SweepReport> {
+  return request<SweepReport>('/api/settings/sweep', { method: 'POST' });
+}
+
+export function formatBytes(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
 }
 
 export function inputModeBadge(mode: InputMode | undefined): { label: string; title: string } | null {

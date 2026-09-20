@@ -191,6 +191,8 @@ def probe_capabilities() -> dict:
         "engine_version": _engine_version(),
         "asset_tools": _asset_tools() is not None,
         "interchange_manager": hasattr(unreal, "InterchangeManager"),
+        "material_editing": hasattr(unreal, "MaterialEditingLibrary"),
+        "sphyl_elem": hasattr(unreal, "KSphylElem"),
         "lod_insert_api": next((name for name in LOD_INSERT_CANDIDATES if _has(static_mesh_cls, name) or _has(esml, name)), None),
         "lod_auto_api": next((name for name in LOD_AUTO_CANDIDATES if _has(esml, name)), None),
         "simple_collision_api": next((name for name in SIMPLE_COLLISION_CANDIDATES if _has(esml, name)), None),
@@ -224,6 +226,8 @@ def _find_sources(source_dir: Path) -> dict:
         (glb for glb in glbs if glb not in (files["lod1"], files["collision"])),
         glbs[0] if glbs else None,
     )
+    pngs = sorted(source_dir.glob("*.png"))
+    files["leaf_atlas"] = next((p for p in pngs if "leaf" in p.name.lower() or "atlas" in p.name.lower()), None)
     return files
 
 
@@ -319,6 +323,298 @@ def _verify_mesh(mesh, report: dict) -> None:
     report["verification"] = verification
 
 
+def _mesh_materials(mesh) -> list:
+    materials = []
+    for prop in ("static_materials", "materials"):
+        try:
+            slots = mesh.get_editor_property(prop) or []
+        except Exception:
+            continue
+        for slot in slots:
+            material = getattr(slot, "material_interface", None)
+            if isinstance(material, unreal.Material) and material not in materials:
+                materials.append(material)
+    return materials
+
+
+def _wind_wpo_chain(material, mel) -> None:
+    """Manual sway on World Position Offset, driven by COLOR_0 wind weights.
+
+    sin(time * speed + worldpos.x * freq) * VertexColor.R * amplitude * direction.
+    UE 5.8 exposes no SimpleGrassWind Python class, so the graph is built
+    from core expressions."""
+    def const(material, mel, x, y, value):
+        node = mel.create_material_expression(material, unreal.MaterialExpressionConstant, x, y)
+        node.set_editor_property("r", value)
+        return node
+
+    time_node = mel.create_material_expression(material, unreal.MaterialExpressionTime, -1400, 500)
+    world = mel.create_material_expression(material, unreal.MaterialExpressionWorldPosition, -1400, 700)
+    freq_vec = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -1200, 850)
+    try:
+        freq_vec.set_editor_property("constant", unreal.LinearColor(0.03, 0.017, 0.0, 1.0))
+    except Exception:
+        pass
+    phase_x = mel.create_material_expression(material, unreal.MaterialExpressionDotProduct, -1000, 700)
+    mel.connect_material_expressions(world, "", phase_x, "A")
+    mel.connect_material_expressions(freq_vec, "", phase_x, "B")
+    speed = const(material, mel, -1200, 550, 1.3)
+    phase_t = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -1000, 500)
+    mel.connect_material_expressions(time_node, "", phase_t, "A")
+    mel.connect_material_expressions(speed, "", phase_t, "B")
+    add = mel.create_material_expression(material, unreal.MaterialExpressionAdd, -800, 600)
+    mel.connect_material_expressions(phase_t, "", add, "A")
+    mel.connect_material_expressions(phase_x, "", add, "B")
+    sine = mel.create_material_expression(material, unreal.MaterialExpressionSine, -600, 600)
+    mel.connect_material_expressions(add, "", sine, "")
+    vc = mel.create_material_expression(material, unreal.MaterialExpressionVertexColor, -600, 820)
+    sway = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -400, 660)
+    mel.connect_material_expressions(sine, "", sway, "A")
+    mel.connect_material_expressions(vc, "R", sway, "B")
+    amplitude = const(material, mel, -400, 860, 6.0)
+    scaled = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -250, 700)
+    mel.connect_material_expressions(sway, "", scaled, "A")
+    mel.connect_material_expressions(amplitude, "", scaled, "B")
+    direction = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -250, 900)
+    try:
+        direction.set_editor_property("constant", unreal.LinearColor(0.7, 0.45, 0.12, 1.0))
+    except Exception:
+        pass
+    offset = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -60, 660)
+    mel.connect_material_expressions(scaled, "", offset, "A")
+    mel.connect_material_expressions(direction, "", offset, "B")
+    mel.connect_material_property(offset, "", unreal.MaterialProperty.MP_WORLD_POSITION_OFFSET)
+
+
+def _foliage_material_fixup(material, mel, foliage: dict, report: dict) -> None:
+    """Two-sided foliage shading + vertex-color-weighted grass wind on WPO."""
+    try:
+        material.set_editor_property("two_sided", True)
+    except Exception:
+        pass
+    shading = getattr(unreal, "MaterialShadingModel", None)
+    for member in ("MSM_TWO_SIDED_FOLIAGE", "MSM_TWOSIDEDFOLIAGE", "TWO_SIDED_FOLIAGE"):
+        if shading is not None and hasattr(shading, member):
+            try:
+                material.set_editor_property("shading_model", getattr(shading, member))
+                break
+            except Exception:
+                continue
+    # Keep the imported blend mode (opaque) — PBR texture alpha is not leaf
+    # alpha, and a masked blend would clip the solid crown.
+    if foliage.get("wind_vertex_colors"):
+        _wind_wpo_chain(material, mel)
+        report["actions"].append(f"wind-wpo-vertex-color-{material.get_name()}")
+    try:
+        mel.recompile_material(material)
+    except Exception:
+        pass
+    report["actions"].append(f"foliage-material-{material.get_name()}")
+
+
+def _mesh_bounds(mesh):
+    """Min/max corners of the render bounds, probed across API variants."""
+    esml = getattr(unreal, "EditorStaticMeshLibrary", None)
+    candidates = [
+        lambda: mesh.get_bounding_box(),
+        lambda: esml.get_lod_bounding_box(mesh, 0) if esml is not None else None,
+        lambda: esml.get_bounding_box(mesh) if esml is not None else None,
+        lambda: mesh.get_bounds(),
+    ]
+    for getter in candidates:
+        try:
+            bounds = getter()
+        except Exception:
+            continue
+        if bounds is None:
+            continue
+        if hasattr(bounds, "min") and hasattr(bounds, "max"):
+            return bounds.min, bounds.max
+        if hasattr(bounds, "origin") and hasattr(bounds, "box_extent"):
+            origin, extent = bounds.origin, bounds.box_extent
+            return origin - extent, origin + extent
+    return None
+
+
+def _find_imported_texture(content_path: str, skip_name: str = ""):
+    """First Texture2D under the package folder, preferring the mesh base color
+    over the leaf atlas."""
+    first = None
+    try:
+        assets = unreal.EditorAssetLibrary.list_assets(content_path, recursive=True)
+    except Exception:
+        return None
+    for path in assets:
+        try:
+            obj = unreal.EditorAssetLibrary.load_asset(path.split(".")[0])
+        except Exception:
+            continue
+        if not isinstance(obj, unreal.Texture2D):
+            continue
+        if skip_name and skip_name.lower() in path.lower():
+            if first is None:
+                first = obj
+            continue
+        return obj
+    return first
+
+
+def _assign_material_slots(mesh, material, report: dict) -> bool:
+    """Point every static material slot at the new foliage material."""
+    try:
+        slot_count = len(mesh.get_editor_property("static_materials") or [])
+    except Exception:
+        slot_count = 1
+    assigned = 0
+    for index in range(max(slot_count, 1)):
+        try:
+            mesh.set_material(index, material)
+            assigned += 1
+        except Exception:
+            break
+    if assigned:
+        report["actions"].append(f"material-slots-assigned-{assigned}-{material.get_name()}")
+        return True
+    return False
+
+
+def _create_foliage_material(mesh, foliage: dict, atlas_texture, content_path: str, caps: dict, report: dict):
+    """Build M_<mesh>_Foliage from scratch: base color texture + masked
+    two-sided foliage shading + vertex-color-weighted wind on WPO."""
+    mel = getattr(unreal, "MaterialEditingLibrary", None)
+    tools = _asset_tools()
+    factory_type = getattr(unreal, "MaterialFactoryNew", None)
+    if mel is None or tools is None or factory_type is None:
+        return None
+    # Search the mesh's own folder (e.g. /Game/HunyForge/SM_xxxx) so the
+    # material samples this mesh's textures, not another import's.
+    mesh_path = mesh.get_path_name().split(".")[0]
+    mesh_root = mesh_path.rsplit("/", 2)[0] if mesh_path.count("/") >= 3 else content_path
+    texture = _find_imported_texture(mesh_root, skip_name="leaf") or _find_imported_texture(content_path, skip_name="leaf") or atlas_texture
+    material = None
+    material_name = f"M_{mesh.get_name()}_Foliage"
+    try:
+        material = tools.create_asset(material_name, content_path, unreal.Material, factory_type())
+    except Exception:
+        pass
+    if material is None:
+        try:
+            material = unreal.EditorAssetLibrary.load_asset(f"{content_path}/{material_name}.{material_name}")
+        except Exception as exc:
+            report["warnings"].append(f"Foliage material asset creation failed: {exc}")
+            return None
+    try:
+        mel.delete_all_material_expressions(material)
+        try:
+            mel.disconnect_material_property(material, unreal.MaterialProperty.MP_OPACITY_MASK)
+        except Exception:
+            pass
+        blend = getattr(unreal, "BlendMode", None)
+        if blend is not None and hasattr(blend, "BLEND_OPAQUE"):
+            try:
+                material.set_editor_property("blend_mode", blend.BLEND_OPAQUE)
+            except Exception:
+                pass
+        if texture is not None:
+            tex = mel.create_material_expression(material, unreal.MaterialExpressionTextureSample, -900, -100)
+            tex.set_editor_property("texture", texture)
+            mel.connect_material_property(tex, "RGB", unreal.MaterialProperty.MP_BASE_COLOR)
+        rough = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -900, 250)
+        rough.set_editor_property("r", 0.85)
+        mel.connect_material_property(rough, "", unreal.MaterialProperty.MP_ROUGHNESS)
+        if foliage.get("wind_vertex_colors"):
+            _wind_wpo_chain(material, mel)
+            report["actions"].append(f"wind-wpo-vertex-color-{material.get_name()}")
+        try:
+            material.set_editor_property("two_sided", True)
+        except Exception:
+            pass
+        shading = getattr(unreal, "MaterialShadingModel", None)
+        for member in ("MSM_TWO_SIDED_FOLIAGE", "MSM_TWOSIDEDFOLIAGE", "TWO_SIDED_FOLIAGE"):
+            if shading is not None and hasattr(shading, member):
+                try:
+                    material.set_editor_property("shading_model", getattr(shading, member))
+                    break
+                except Exception:
+                    continue
+        # Solid generated meshes stay opaque — PBR texture alpha is not leaf
+        # alpha, so a masked blend would clip the whole crown. The leaf atlas
+        # ships separately for card-based foliage.
+        mel.recompile_material(material)
+        unreal.EditorAssetLibrary.save_loaded_asset(material)
+        report["actions"].append(f"foliage-material-created-{material.get_name()}")
+    except Exception as exc:
+        report["warnings"].append(f"Foliage material graph build failed: {exc}")
+        return material
+    if _assign_material_slots(mesh, material, report):
+        report["actions"].append("foliage-material-assigned-to-slots")
+    else:
+        report["manual_steps"].append(f"Assign {material.get_path_name().split('.')[0]} to the mesh's material slots in the StaticMesh Editor.")
+    return material
+
+
+def _apply_trunk_capsule(mesh, capsule: dict | None, caps: dict, report: dict) -> None:
+    """UE 5.8 Python cannot write AggGeom elements, so this fits a capsule to
+    the whole mesh and records the trunk-only dims for a quick manual resize."""
+    esml = getattr(unreal, "EditorStaticMeshLibrary", None)
+    enum_value = _collision_enum("capsule")
+    api = caps.get("simple_collision_api")
+    if api and enum_value is not None and esml is not None:
+        try:
+            getattr(esml, api)(mesh, enum_value)
+            report["actions"].append(f"capsule-collision-via-{api}")
+            if capsule:
+                radius_cm = float(capsule.get("radius") or 0.0) * 100.0
+                height_cm = float(capsule.get("top_fraction") or 0.0) * float(capsule.get("height") or 0.0) * 100.0
+                report["warnings"].append(
+                    "Fitted capsule covers the whole mesh. For trunk-only collision, resize the capsule to "
+                    f"radius ~{radius_cm:.0f} cm and height ~{height_cm:.0f} cm in the StaticMesh Editor."
+                )
+            return
+        except Exception as exc:
+            report["warnings"].append(f"Capsule collision via {api} failed: {exc}")
+    report["manual_steps"].append("Vegetation: add a capsule collision around the trunk only (StaticMesh Editor > Collision > Add Capsule Simplified Collision, then resize to the trunk).")
+
+
+def _apply_foliage(mesh, sources: dict, manifest: dict, content_path: str, caps: dict, report: dict) -> None:
+    foliage = manifest.get("foliage") or {}
+    if not foliage:
+        return
+    atlas_path = sources.get("leaf_atlas")
+    atlas_texture = None
+    if atlas_path is not None:
+        try:
+            imported = _import_file(atlas_path, content_path)
+            report["actions"].append(f"imported-{atlas_path.name}")
+            for path in imported:
+                try:
+                    loaded = unreal.EditorAssetLibrary.load_asset(path.split(".")[0])
+                except Exception:
+                    loaded = None
+                if isinstance(loaded, unreal.Texture2D):
+                    atlas_texture = loaded
+                    break
+        except Exception as exc:
+            report["warnings"].append(f"Leaf atlas import failed: {exc}")
+    mel = getattr(unreal, "MaterialEditingLibrary", None)
+    materials = _mesh_materials(mesh)
+    if mel is not None and materials:
+        for material in materials:
+            try:
+                _foliage_material_fixup(material, mel, foliage, report)
+            except Exception as exc:
+                report["warnings"].append(f"Foliage material fixup failed on {material.get_name()}: {exc}")
+    else:
+        material = _create_foliage_material(mesh, foliage, atlas_texture, content_path, caps, report)
+        if material is None:
+            report["manual_steps"].append(
+                "Vegetation material: create a masked two-sided material with the Two Sided Foliage shading model, "
+                "assign the imported base color texture, add VertexColor.R x SimpleGrassWind into World Position "
+                "Offset for wind sway, and assign it to the mesh's material slots."
+            )
+    _apply_trunk_capsule(mesh, foliage.get("trunk_capsule"), caps, report)
+
+
 def _vehicle_steps(manifest: dict, report: dict) -> None:
     vehicle = manifest.get("vehicle")
     if not vehicle:
@@ -401,9 +697,10 @@ def main() -> dict:
 
         if sources["lod1"] is not None:
             _apply_lod(mesh, sources["lod1"], caps, report)
-        if sources["collision"] is not None or manifest.get("collision"):
-            mode = str(manifest.get("collision_mode") or "convex_hull")
-            _apply_collision(mesh, sources["collision"], mode, caps, report)
+        collision_mode = str(manifest.get("collision_mode") or "convex_hull")
+        if collision_mode != "trunk" and (sources["collision"] is not None or manifest.get("collision")):
+            _apply_collision(mesh, sources["collision"], collision_mode, caps, report)
+        _apply_foliage(mesh, sources, manifest, content_path, caps, report)
         try:
             unreal.EditorAssetLibrary.save_loaded_asset(mesh)
         except Exception as exc:

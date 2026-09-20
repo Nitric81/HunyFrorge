@@ -34,3 +34,6 @@ unity-smoke-test/smoke-test-report.json
 
 # The Unity smoke-test project is local verification material, not application source.
 unity-smoke-test/
+
+# Per-user asset pipelines and generated output, not application source.
+ironhound-assets/

@@ -16,8 +16,19 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.background import BackgroundTask
 
-from .models import GenerationSettings
+from .models import AppSettings, GenerationSettings
+from .storage import SettingsStore
 from .worker_runtime import RuntimeEngine, memory_snapshot
+
+
+def _runtime_settings() -> AppSettings:
+    """Live user settings; falls back to env-seeded defaults when the data
+    root has no settings.json or it cannot be read."""
+    try:
+        root = Path(os.environ.get("HUNYFORGE_DATA_ROOT", Path.cwd() / "data"))
+        return SettingsStore(root).load()
+    except Exception:
+        return AppSettings()
 
 
 class MeshToken(BaseModel):
@@ -60,20 +71,17 @@ class PreviewRequest(BaseModel):
 
 def stage_isolation_enabled() -> bool:
     """Run each stage in a fresh subprocess so exit reclaims all model RSS."""
-    return os.getenv("HUNYFORGE_STAGE_ISOLATION", "1") == "1"
+    return _runtime_settings().stage_isolation
 
 
 def admission_error() -> str | None:
     """Reject work when the VM lacks headroom instead of OOMing mid-stage."""
-    try:
-        required = int(os.getenv("HUNYFORGE_MIN_AVAILABLE_MB", "12288"))
-    except ValueError:
-        required = 12288
+    required = _runtime_settings().min_available_mb
     if required <= 0:
         return None
     available = memory_snapshot().get("available_mb")
     if available is not None and available < required:
-        return f"insufficient_memory: {available}MiB available < {required}MiB required (HUNYFORGE_MIN_AVAILABLE_MB)"
+        return f"insufficient_memory: {available}MiB available < {required}MiB required (min_available_mb setting)"
     return None
 
 

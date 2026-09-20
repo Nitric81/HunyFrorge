@@ -30,6 +30,7 @@ from .models import (
     current_runtime_config,
     now,
     resolve_generation_settings,
+    t2i_config,
 )
 from .storage import JobStore, sha256_file
 from .telemetry import StageTelemetry
@@ -220,6 +221,243 @@ def _prepare_rigged_unity_geometry(loaded: trimesh.Scene, data: bytes, settings:
     return produced, notes
 
 
+def _trunk_capsule_params(mesh: trimesh.Trimesh) -> dict:
+    """Estimate trunk position/radius from the bottom quarter of the mesh.
+    Used for both the collision capsule and the Unreal manifest's foliage block."""
+    verts = np.asarray(mesh.vertices)
+    ymin, ymax = float(verts[:, 1].min()), float(verts[:, 1].max())
+    height = max(ymax - ymin, 1e-6)
+    base = verts[verts[:, 1] <= ymin + 0.25 * height]
+    if base.shape[0] < 8:
+        base = verts
+    cx, cz = float(np.median(base[:, 0])), float(np.median(base[:, 2]))
+    radius = float(np.percentile(np.hypot(base[:, 0] - cx, base[:, 2] - cz), 80)) * 1.15
+    radius = max(radius, 0.02 * height, 0.01)
+    return {"center_x": cx, "center_z": cz, "base_y": ymin, "radius": radius, "top_fraction": 0.45, "height": height}
+
+
+def _trunk_collision_mesh(mesh: trimesh.Trimesh, params: dict) -> trimesh.Trimesh:
+    """A capsule around the trunk only, so canopy does not block movement."""
+    cylinder = max(params["top_fraction"] * params["height"] - 2 * params["radius"], 0.01)
+    capsule = trimesh.creation.capsule(radius=params["radius"], height=cylinder)
+    capsule.apply_transform(trimesh.transformations.rotation_matrix(math.pi / 2, [1, 0, 0]))
+    top_y = params["base_y"] + params["top_fraction"] * params["height"]
+    capsule.apply_translation([params["center_x"], (params["base_y"] + top_y) / 2, params["center_z"]])
+    return capsule
+
+
+def _glb_add_vertex_colors(data: bytes) -> bytes:
+    """Append a normalized COLOR_0 (u8x4) attribute to every primitive.
+
+    R = sway weight (radial distance from the trunk axis blended with height);
+    G = normalized height (phase variation for the wind material).
+    The trunk axis is the XZ median of vertices in the bottom 30% of the mesh.
+    """
+    if len(data) < 20 or data[:4] != b"glTF":
+        return data
+    json_len, _json_type = struct.unpack_from("<II", data, 12)
+    gltf = json.loads(data[20:20 + json_len])
+    bin_offset = 20 + json_len
+    bin_chunk = b""
+    if bin_offset + 8 <= len(data):
+        bin_len, _bin_type = struct.unpack_from("<II", data, bin_offset)
+        bin_chunk = data[bin_offset + 8:bin_offset + 8 + bin_len]
+    accessors = gltf.setdefault("accessors", [])
+    views = gltf.setdefault("bufferViews", [])
+    buffers = gltf.get("buffers") or [{}]
+    extra = bytearray()
+
+    def read_positions(accessor_index: int) -> np.ndarray:
+        acc = accessors[accessor_index]
+        view = views[acc["bufferView"]]
+        offset = view.get("byteOffset", 0) + acc.get("byteOffset", 0)
+        count = acc["count"]
+        stride = view.get("byteStride") or 12
+        if stride == 12:
+            return np.frombuffer(bin_chunk, dtype="<f4", count=count * 3, offset=offset).reshape(count, 3).copy()
+        rows = np.empty((count, 3), dtype=np.float32)
+        for index in range(count):
+            rows[index] = np.frombuffer(bin_chunk, dtype="<f4", count=3, offset=offset + index * stride)
+        return rows
+
+    changed = False
+    for mesh in gltf.get("meshes", []):
+        for primitive in mesh.get("primitives", []):
+            pos_index = primitive.get("attributes", {}).get("POSITION")
+            if pos_index is None:
+                continue
+            positions = read_positions(pos_index)
+            if positions.shape[0] == 0:
+                continue
+            ymin, ymax = float(positions[:, 1].min()), float(positions[:, 1].max())
+            height = max(ymax - ymin, 1e-6)
+            base = positions[positions[:, 1] <= ymin + 0.3 * height]
+            if base.shape[0] < 4:
+                base = positions
+            cx, cz = float(np.median(base[:, 0])), float(np.median(base[:, 2]))
+            radial = np.hypot(positions[:, 0] - cx, positions[:, 2] - cz)
+            radial_max = float(np.percentile(radial, 98)) or 1.0
+            rnorm = np.clip(radial / radial_max, 0.0, 1.0)
+            hnorm = np.clip((positions[:, 1] - ymin) / height, 0.0, 1.0)
+            sway = np.clip(0.65 * rnorm + 0.35 * hnorm, 0.0, 1.0)
+            colors = np.zeros((positions.shape[0], 4), dtype=np.uint8)
+            colors[:, 0] = np.round(sway * 255).astype(np.uint8)
+            colors[:, 1] = np.round(hnorm * 255).astype(np.uint8)
+            colors[:, 3] = 255
+            extra += b"\x00" * ((4 - len(extra) % 4) % 4)
+            views.append({"buffer": 0, "byteOffset": len(bin_chunk) + len(extra), "byteLength": colors.nbytes, "target": 34962})
+            accessor_index = len(accessors)
+            accessors.append({"bufferView": len(views) - 1, "componentType": 5121, "count": int(positions.shape[0]), "type": "VEC4", "normalized": True})
+            extra += colors.tobytes()
+            primitive["attributes"]["COLOR_0"] = accessor_index
+            changed = True
+    if not changed:
+        return data
+    bin_chunk = bin_chunk + bytes(extra)
+    buffers[0]["byteLength"] = len(bin_chunk)
+    gltf["buffers"] = buffers
+    encoded = json.dumps(gltf, separators=(",", ":")).encode()
+    encoded += b" " * ((4 - len(encoded) % 4) % 4)
+    bin_chunk += b"\x00" * ((4 - len(bin_chunk) % 4) % 4)
+    return (
+        struct.pack("<III", 0x46546C67, 2, 12 + 8 + len(encoded) + 8 + len(bin_chunk))
+        + struct.pack("<II", len(encoded), 0x4E4F534A)
+        + encoded
+        + struct.pack("<II", len(bin_chunk), 0x004E4942)
+        + bin_chunk
+    )
+
+
+def glb_has_vertex_colors(data: bytes) -> bool:
+    try:
+        json_len, _json_type = struct.unpack_from("<II", data, 12)
+        gltf = json.loads(data[20:20 + json_len])
+        for mesh in gltf.get("meshes", []):
+            for primitive in mesh.get("primitives", []):
+                if "COLOR_0" in (primitive.get("attributes") or {}):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _glb_position_accessors(gltf: dict) -> list[int]:
+    indices: list[int] = []
+    for mesh in gltf.get("meshes", []):
+        for primitive in mesh.get("primitives", []):
+            pos_index = primitive.get("attributes", {}).get("POSITION")
+            if pos_index is not None:
+                indices.append(pos_index)
+    return indices
+
+
+def _read_glb_positions(accessor: dict, view: dict, bin_chunk: bytes) -> np.ndarray:
+    offset = view.get("byteOffset", 0) + accessor.get("byteOffset", 0)
+    count = accessor["count"]
+    stride = view.get("byteStride") or 12
+    if stride == 12:
+        return np.frombuffer(bin_chunk, dtype="<f4", count=count * 3, offset=offset).reshape(count, 3).copy()
+    rows = np.empty((count, 3), dtype=np.float32)
+    for index in range(count):
+        rows[index] = np.frombuffer(bin_chunk, dtype="<f4", count=3, offset=offset + index * stride)
+    return rows
+
+
+def _scale_glb(data: bytes, scale: float, lift_base: bool = True) -> bytes:
+    """Scale all POSITION data and optionally lift min-Y to 0 (pivot at base).
+
+    Assumes identity node transforms (true for HunyForge exports). Returns the
+    input unchanged if the GLB cannot be parsed or has no position data.
+    """
+    if len(data) < 20 or data[:4] != b"glTF":
+        return data
+    json_len, _json_type = struct.unpack_from("<II", data, 12)
+    gltf = json.loads(data[20:20 + json_len])
+    bin_offset = 20 + json_len
+    if bin_offset + 8 > len(data):
+        return data
+    bin_len, _bin_type = struct.unpack_from("<II", data, bin_offset)
+    bin_chunk = bytearray(data[bin_offset + 8:bin_offset + 8 + bin_len])
+    accessors = gltf.get("accessors", [])
+    views = gltf.get("bufferViews", [])
+    pos_indices = _glb_position_accessors(gltf)
+    if not pos_indices:
+        return data
+    all_pos = []
+    for index in pos_indices:
+        acc = accessors[index]
+        view = views[acc["bufferView"]]
+        all_pos.append(_read_glb_positions(acc, view, bytes(bin_chunk)))
+    min_y = min(float(p[:, 1].min()) for p in all_pos if p.shape[0]) if all_pos else 0.0
+    lift = -min_y * scale if lift_base else 0.0
+    for index, positions in zip(pos_indices, all_pos):
+        acc = accessors[index]
+        view = views[acc["bufferView"]]
+        transformed = positions * scale
+        transformed[:, 1] += lift
+        offset = view.get("byteOffset", 0) + acc.get("byteOffset", 0)
+        stride = view.get("byteStride") or 12
+        for row_index, row in enumerate(transformed):
+            struct.pack_into("<fff", bin_chunk, offset + row_index * stride, float(row[0]), float(row[1]), float(row[2]))
+        acc["min"] = [float(v) for v in transformed.min(axis=0)]
+        acc["max"] = [float(v) for v in transformed.max(axis=0)]
+    encoded = json.dumps(gltf, separators=(",", ":")).encode()
+    encoded += b" " * ((4 - len(encoded) % 4) % 4)
+    body = bytes(bin_chunk) + b"\x00" * ((4 - len(bin_chunk) % 4) % 4)
+    return (
+        struct.pack("<III", 0x46546C67, 2, 12 + 8 + len(encoded) + 8 + len(body))
+        + struct.pack("<II", len(encoded), 0x4E4F534A)
+        + encoded
+        + struct.pack("<II", len(body), 0x004E4942)
+        + body
+    )
+
+
+def _glb_height(data: bytes) -> float | None:
+    """Height (max_y - min_y) of the first POSITION accessor's bounds, or None."""
+    try:
+        json_len, _json_type = struct.unpack_from("<II", data, 12)
+        gltf = json.loads(data[20:20 + json_len])
+        heights = []
+        for index in _glb_position_accessors(gltf):
+            acc = gltf["accessors"][index]
+            if "min" in acc and "max" in acc:
+                heights.append(float(acc["max"][1]) - float(acc["min"][1]))
+        return max(heights) if heights else None
+    except Exception:
+        return None
+
+
+def _leaf_atlas_prompt(job: JobStatus) -> str:
+    subject = (job.prompt or "tree").strip()
+    return (
+        f"one small flat sprig of {subject} foliage, a single short branchlet with leaves and needles, "
+        "straight-on orthographic view, entire sprig visible, evenly lit, high detail, "
+        "solid flat pure magenta background, no shadow, no trunk, no ground"
+    )
+
+
+def chroma_key_png(png: bytes, key=(255, 0, 255)) -> bytes:
+    """Keyed magenta-background leaf atlas: soft alpha edge, content crop."""
+    from PIL import Image
+    image = Image.open(BytesIO(png)).convert("RGBA")
+    arr = np.asarray(image).astype(np.float32)
+    dist = np.abs(arr[..., :3] - np.asarray(key, dtype=np.float32)).sum(axis=2)
+    alpha = np.clip((dist - 90.0) * (255.0 / 120.0), 0, 255)
+    arr[..., 3] = alpha
+    ys, xs = np.where(alpha > 8)
+    if len(xs) == 0:
+        raise ValueError("Leaf atlas chroma key removed the entire image")
+    margin = 16
+    out = Image.fromarray(arr.astype(np.uint8)).crop(
+        (max(0, int(xs.min()) - margin), max(0, int(ys.min()) - margin),
+         min(image.width, int(xs.max()) + margin + 1), min(image.height, int(ys.max()) + margin + 1))
+    )
+    buffer = BytesIO()
+    out.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 def prepare_unity_geometry(data: bytes, settings: GenerationSettings, telemetry: StageTelemetry | None = None) -> tuple[dict[str, bytes], list[str]]:
     """Normalize a GLB and derive LOD/collision geometry through trimesh."""
     loaded = trimesh.load(BytesIO(data), file_type="glb", force="scene")
@@ -283,6 +521,9 @@ def prepare_unity_geometry(data: bytes, settings: GenerationSettings, telemetry:
             if settings.collision_mode == "box":
                 collision_mesh = working.bounding_box
                 notes.append("collision-bounding-box")
+            elif settings.collision_mode == "trunk":
+                collision_mesh = _trunk_collision_mesh(working, _trunk_capsule_params(working))
+                notes.append("collision-trunk-capsule")
             else:
                 collision_mesh = working.convex_hull
                 notes.append("collision-convex-hull")
@@ -844,6 +1085,22 @@ class Pipeline:
         self._stage_finish(job, "rig", "complete")
         return True
 
+    async def _leaf_atlas_bytes(self, job: JobStatus) -> bytes:
+        """Generate a leaf-spray atlas via the worker's T2I preview endpoint and
+        chroma-key it to alpha. Runs in the unity stage when the GPU is free."""
+        url = os.getenv("HUNYUAN_API_URL", "http://127.0.0.1:8082").rstrip("/") + "/preview"
+        payload = {"prompt": _leaf_atlas_prompt(job), "seed": (job.seed + 7919) % (2 ** 32), "width": 1024, "height": 1024}
+
+        def call() -> dict:
+            request = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(request, timeout=int(os.getenv("HUNYFORGE_T2I_TIMEOUT_SECONDS", "300"))) as response:
+                return json.loads(response.read().decode("utf-8", errors="replace"))
+
+        result = await asyncio.to_thread(call)
+        image = result.get("image") or ""
+        raw = image.split(",", 1)[1] if image.startswith("data:") and "," in image else image
+        return chroma_key_png(base64.b64decode(raw))
+
     async def _unity_stage(self, job: JobStatus, settings: GenerationSettings, telemetry: StageTelemetry) -> bool:
         if self._cancel_pending(job):
             self._finalize_cancel(job, "unity")
@@ -855,6 +1112,16 @@ class Pipeline:
             data = await self._await_operation(asyncio.to_thread((directory / source_name).read_bytes), job, "unity")
             with telemetry.measure("unity"):
                 produced, notes = await self._await_operation(asyncio.to_thread(prepare_unity_geometry, data, settings, telemetry), job, "unity")
+            if job.asset_type == "vegetation":
+                with telemetry.measure("wind_vertex_colors"):
+                    produced = {name: (_glb_add_vertex_colors(content) if name.endswith(".glb") and "collision" not in name else content) for name, content in produced.items()}
+                notes.append("wind-vertex-colors-applied")
+            if settings.target_height_m:
+                source_height = _glb_height(produced.get("unity-lod0.glb", b""))
+                if source_height and source_height > 0:
+                    with telemetry.measure("rescale"):
+                        produced = {name: (_scale_glb(content, settings.target_height_m / source_height, lift_base=True) if name.endswith(".glb") else content) for name, content in produced.items()}
+                    notes.append(f"rescaled-to-{settings.target_height_m}m")
             for name, content in produced.items():
                 self.store.add_artifact(job, name, content)
             produced_unreal: dict[str, bytes] = {}
@@ -862,6 +1129,16 @@ class Pipeline:
                 produced_unreal = {UNREAL_ARTIFACT_NAMES[name]: content for name, content in produced.items() if name in UNREAL_ARTIFACT_NAMES}
                 for name, content in produced_unreal.items():
                     self.store.add_artifact(job, name, content)
+            leaf_atlas: bytes | None = None
+            if job.asset_type == "vegetation" and job.unreal_export and job.backend != "demo" and t2i_config()["enabled"]:
+                try:
+                    with telemetry.measure("leaf_atlas"):
+                        leaf_atlas = await self._await_operation(self._leaf_atlas_bytes(job), job, "unity")
+                    self.store.add_artifact(job, "leaf-atlas.png", leaf_atlas)
+                    notes.append("leaf-atlas-generated")
+                except Exception as exc:
+                    leaf_atlas = None
+                    notes.append(f"leaf-atlas-unavailable:{exc}")
             shape_checks, texture_checks, unity_ready = await self._await_operation(asyncio.to_thread(self._export_checks, job), job, "unity")
             manifest = {
                 "job_id": str(job.id),
@@ -912,7 +1189,7 @@ class Pipeline:
                     "collision_mode": settings.collision_mode if settings.generate_collision else None,
                     "memory_policy": "sequential-shape-texture",
                     "geometry_notes": notes,
-                    "artifacts": {name: sha256_file(directory / name) for name in produced_unreal},
+                    "artifacts": {name: sha256_file(directory / name) for name in list(produced_unreal) + (["leaf-atlas.png"] if leaf_atlas else [])},
                     "telemetry": self._collect_telemetry(job),
                     "checks": {"shape": shape_checks, "texture": texture_checks},
                     "import": {
@@ -921,6 +1198,22 @@ class Pipeline:
                         "plugin_requirements": ["Python Editor Script Plugin", "Editor Scripting Utilities", "Interchange (glTF import)"],
                     },
                 }
+                if job.asset_type == "vegetation":
+                    trunk_params = None
+                    if settings.collision_mode == "trunk" and "unity-lod0.glb" in produced:
+                        try:
+                            trunk_params = _trunk_capsule_params(scene_to_mesh(trimesh.load(BytesIO(produced["unity-lod0.glb"]), file_type="glb", force="scene")))
+                        except Exception:
+                            trunk_params = None
+                    unreal_manifest["foliage"] = {
+                        "material_mode": "masked",
+                        "two_sided": True,
+                        "shading_model": "two_sided_foliage",
+                        "wind_vertex_colors": True,
+                        "wind_channels": {"R": "sway_weight", "G": "normalized_height"},
+                        "leaf_atlas": "leaf-atlas.png" if leaf_atlas else None,
+                        "trunk_capsule": trunk_params,
+                    }
                 if job.rig_spec:
                     unreal_manifest["vehicle"] = {
                         "source_mesh": source_name,
@@ -1075,11 +1368,21 @@ class Pipeline:
                             unreal_blocking.append(f"unreal-export-{name}-uv-material")
                 else:
                     unreal_checks.append(f"{name}-present")
+            if job.asset_type == "vegetation":
+                for name in unreal_expected_lods:
+                    path = directory / name
+                    if path.is_file():
+                        has_colors = glb_has_vertex_colors(path.read_bytes())
+                        unreal_checks.append(f"{name}-vertex-colors-{'present' if has_colors else 'missing'}")
+                        if not has_colors:
+                            unreal_blocking.append(f"unreal-export-{name}-vertex-colors")
             blocking += unreal_blocking
             unreal_ready = not unreal_blocking
         warnings = []
         if job.backend == "demo":
             warnings.append({"severity": "info", "message": "Demo geometry is a test artifact; replace with Hunyuan output before production use."})
+        if job.asset_type == "vegetation" and job.unreal_export and not (directory / "leaf-atlas.png").is_file():
+            warnings.append({"severity": "info", "message": "Leaf atlas was not generated (T2I disabled or worker unavailable); card-based foliage meshes can bind any leaf texture instead."})
         for note in manifest.get("geometry_notes", []):
             if "missed" in note or "unavailable" in note or "fallback" in note:
                 warnings.append({"severity": "warning", "message": note})
@@ -1124,6 +1427,7 @@ class Pipeline:
             "unreal-lod0.glb": f"{asset}.glb",
             "unreal-lod1.glb": f"{asset}_LOD1.glb",
             "unreal-collision.glb": f"Collision_{asset}.glb",
+            "leaf-atlas.png": f"T_Leaf_{asset}.png",
         }
         extras = ["hunyforge-unreal-manifest.json", "validation-report.json", "vehicle-rig-report.json"]
         setup_script = UNREAL_DIR / "HunyForgeUnrealSetup.py"

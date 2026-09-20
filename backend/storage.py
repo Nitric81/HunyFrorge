@@ -8,6 +8,7 @@ from threading import Lock
 from uuid import UUID, uuid4
 
 from .models import (
+    AppSettings,
     Checkpoint,
     GenerationSettings,
     JobStage,
@@ -46,6 +47,43 @@ def sha256_file(path: Path) -> str:
             return digest.hexdigest()
 
     return _retry_transient(digest_file)
+
+
+def directory_size(root: Path) -> int:
+    total = 0
+    for path in root.rglob("*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+class SettingsStore:
+    """settings.json persistence. Missing or corrupt files fall back to
+    env-seeded defaults; a corrupt file is quarantined, not overwritten."""
+
+    def __init__(self, root: Path):
+        self.path = Path(root) / "settings.json"
+
+    def load(self) -> AppSettings:
+        if not self.path.is_file():
+            return AppSettings()
+        try:
+            return AppSettings.model_validate(json.loads(self.path.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, ValueError):
+            try:
+                _replace_atomic(self.path, self.path.with_suffix(".json.corrupt"))
+            except OSError:
+                pass
+            return AppSettings()
+
+    def save(self, settings: AppSettings) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(settings.model_dump_json(indent=2), encoding="utf-8")
+        _replace_atomic(temporary, self.path)
 
 
 class JobStore:
@@ -107,6 +145,19 @@ class JobStore:
                 actions.append("resume_unity")
         job.available_actions = actions
         return job
+
+    def delete_job(self, job_id: UUID) -> bool:
+        path = self.path(job_id)
+        if not path.is_dir():
+            return False
+        shutil.rmtree(path)
+        return True
+
+    def disk_usage(self) -> dict:
+        job_dirs = [path for path in self.jobs.iterdir() if path.is_dir()] if self.jobs.is_dir() else []
+        jobs_bytes = sum(directory_size(path) for path in job_dirs)
+        projects_bytes = directory_size(self.projects) if self.projects.is_dir() else 0
+        return {"total_bytes": jobs_bytes + projects_bytes, "jobs_bytes": jobs_bytes, "projects_bytes": projects_bytes, "job_count": len(job_dirs)}
 
     def recover_incomplete_jobs(self) -> int:
         """Mark jobs interrupted by an API/container restart as failed."""

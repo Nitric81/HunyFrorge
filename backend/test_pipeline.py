@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from .models import GenerationSettings, JobCreate, JobStage, JobStatus, Project, load_generation_presets, resolve_generation_settings
-from .pipeline import HunyuanOmniAdapter, HunyuanShapeAdapter, Pipeline, prepare_unity_geometry, scene_to_mesh, texture_quality_checks, validate_glb
+from .pipeline import HunyuanOmniAdapter, HunyuanShapeAdapter, Pipeline, chroma_key_png, glb_has_vertex_colors, _glb_add_vertex_colors, _trunk_capsule_params, _trunk_collision_mesh, prepare_unity_geometry, scene_to_mesh, texture_quality_checks, validate_glb
 from .storage import JobStore, sha256_file
 
 
@@ -385,6 +385,134 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("unreal-export-unreal-lod1.glb", blocking)
             self.assertIn("unreal-manifest-missing", blocking)
             self.assertIn("unreal-lod0.glb-present", report["checks"]["unreal"])
+
+    @staticmethod
+    def _y_trunk(radius: float, height: float):
+        import trimesh
+
+        trunk = trimesh.creation.cylinder(radius=radius, height=height)
+        trunk.apply_transform(trimesh.transformations.rotation_matrix(1.5707963, [1, 0, 0]))
+        return trunk
+
+    def test_trunk_collision_produces_capsule_narrower_than_crown(self) -> None:
+        import numpy as np
+        import trimesh
+
+        trunk = self._y_trunk(0.15, 4.0)
+        trunk.apply_translation([0, 2.0, 0])
+        crown = trimesh.creation.icosphere(radius=1.6)
+        crown.apply_translation([0, 3.6, 0])
+        tree = trimesh.util.concatenate([trunk, crown])
+        data = bytes(tree.export(file_type="glb"))
+        produced, notes = prepare_unity_geometry(data, _settings(generate_lods=False, collision_mode="trunk"))
+        self.assertIn("collision-trunk-capsule", notes)
+        collision = scene_to_mesh(trimesh.load(BytesIO(produced["unity-collision.glb"]), file_type="glb", force="scene"))
+        radial = np.hypot(collision.vertices[:, 0], collision.vertices[:, 2])
+        self.assertLess(float(radial.max()), 0.8)
+        self.assertLess(float(collision.vertices[:, 1].min()), 0.5)
+
+    def test_trunk_capsule_params_track_base_vertices(self) -> None:
+        import trimesh
+
+        trunk = self._y_trunk(0.2, 4.0)
+        trunk.apply_translation([0, 2.0, 0])
+        crown = trimesh.creation.icosphere(radius=1.5)
+        crown.apply_translation([0.8, 3.5, 0])
+        tree = trimesh.util.concatenate([trunk, crown])
+        params = _trunk_capsule_params(tree)
+        self.assertLess(abs(params["center_x"]), 0.4)
+        self.assertLess(params["radius"], 0.5)
+        capsule = _trunk_collision_mesh(tree, params)
+        self.assertIsInstance(capsule, trimesh.Trimesh)
+        self.assertGreater(capsule.faces.shape[0], 0)
+
+    def test_vertex_color_injection_preserves_geometry(self) -> None:
+        import trimesh
+
+        tree = self._y_trunk(0.2, 3.0)
+        data = bytes(tree.export(file_type="glb"))
+        colored = _glb_add_vertex_colors(data)
+        self.assertNotEqual(colored, data)
+        self.assertTrue(glb_has_vertex_colors(colored))
+        self.assertFalse(glb_has_vertex_colors(data))
+        mesh = scene_to_mesh(trimesh.load(BytesIO(colored), file_type="glb", force="scene"))
+        self.assertAlmostEqual(float(mesh.vertices[:, 1].min()), -1.5, places=3)
+        self.assertAlmostEqual(float(mesh.vertices[:, 1].max()), 1.5, places=3)
+
+    def test_chroma_key_produces_alpha_and_crops(self) -> None:
+        import numpy as np
+        from PIL import Image
+
+        image = Image.new("RGB", (64, 64), (255, 0, 255))
+        for y in range(24, 40):
+            for x in range(24, 40):
+                image.putpixel((x, y), (30, 120, 40))
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        keyed = chroma_key_png(buffer.getvalue())
+        result = np.asarray(Image.open(BytesIO(keyed)).convert("RGBA"))
+        self.assertLess(result.shape[0], 64)
+        center = result[result.shape[0] // 2, result.shape[1] // 2]
+        self.assertGreater(int(center[3]), 200)
+
+    def test_demo_vegetation_job_emits_foliage_manifest_block(self) -> None:
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = JobStore(Path(directory))
+            job = JobStatus(backend="demo", texture=True, asset_type="vegetation", unreal_export=True, parameters={"collision_mode": "trunk"})
+            store.save(job)
+            asyncio.run(Pipeline(store).run(job))
+            result = store.get(job.id)
+            assert result is not None
+            self.assertEqual(result.stage, JobStage.COMPLETE)
+            artifacts = store.path(job.id) / "artifacts"
+            manifest = json.loads((artifacts / "hunyforge-unreal-manifest.json").read_text())
+            foliage = manifest.get("foliage")
+            self.assertIsNotNone(foliage)
+            self.assertTrue(foliage["wind_vertex_colors"])
+            self.assertTrue(foliage["two_sided"])
+            self.assertIsNotNone(foliage["trunk_capsule"])
+            self.assertTrue(glb_has_vertex_colors((artifacts / "unreal-lod0.glb").read_bytes()))
+            report = json.loads((artifacts / "validation-report.json").read_text())
+            self.assertTrue(report["unreal_ready"])
+            self.assertIn("unreal-lod0.glb-vertex-colors-present", report["checks"]["unreal"])
+            asset = f"SM_{str(job.id).replace('-', '')[:8]}"
+            with zipfile.ZipFile(artifacts / "unreal-package.zip") as package:
+                names = set(package.namelist())
+            self.assertIn(f"HunyForge/{asset}.glb", names)
+
+    def test_vegetation_requires_vertex_colors_in_unreal_export(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = JobStore(Path(directory))
+            job = JobStatus(backend="hunyuan3d-2.1", texture=True, asset_type="vegetation", unreal_export=True)
+            store.save(job)
+            artifacts = store.path(job.id) / "artifacts"
+            artifacts.mkdir(parents=True, exist_ok=True)
+            from .pipeline import make_demo_glb
+
+            textured = _textured_glb()
+            settings = _settings()
+            for name in ("white-mesh.glb", "textured-mesh.glb", "unity-lod0.glb", "unity-lod1.glb", "unity-collision.glb", "unreal-lod0.glb", "unreal-lod1.glb", "unreal-collision.glb"):
+                (artifacts / name).write_bytes(textured if "lod" in name or "textured" in name else make_demo_glb())
+            manifest = {
+                "job_id": str(job.id),
+                "lods": ["unity-lod0.glb", "unity-lod1.glb"],
+                "collision": "unity-collision.glb",
+                "artifacts": {name: sha256_file(artifacts / name) for name in ("unity-lod0.glb", "unity-lod1.glb", "unity-collision.glb")},
+            }
+            (artifacts / "hunyforge-manifest.json").write_text(json.dumps(manifest))
+            unreal_manifest = {
+                "job_id": str(job.id),
+                "lods": ["unreal-lod0.glb", "unreal-lod1.glb"],
+                "collision": "unreal-collision.glb",
+                "artifacts": {name: sha256_file(artifacts / name) for name in ("unreal-lod0.glb", "unreal-lod1.glb", "unreal-collision.glb")},
+            }
+            (artifacts / "hunyforge-unreal-manifest.json").write_text(json.dumps(unreal_manifest))
+            report, ok = Pipeline(store)._build_validation_report(job, settings)
+            self.assertFalse(ok)
+            blocking = {entry["check"] for entry in report["blocking_failures"]}
+            self.assertIn("unreal-export-unreal-lod0.glb-vertex-colors", blocking)
 
 
 if __name__ == "__main__":
