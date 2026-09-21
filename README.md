@@ -2,7 +2,7 @@
 
 HunyForge is a local-first 3D asset workbench: generate or reconstruct an asset, prepare it for Unity, inspect the result, and keep every job, artifact, and reference image on your machine.
 
-It combines a React/Three.js UI with a FastAPI job service and local CUDA inference. The supported local workflows include image-to-3D, native multi-view reconstruction, text-to-3D, text-guided retexturing, Unity packaging, and vehicle wheel rigging.
+It combines a React/Three.js UI with a FastAPI job service and local CUDA inference. The supported local workflows include image-to-3D, native multi-view reconstruction, text-to-3D, transparent 2D sprite creation, text-guided retexturing, Unity packaging, and vehicle wheel rigging.
 
 ## What it does
 
@@ -11,6 +11,7 @@ It combines a React/Three.js UI with a FastAPI job service and local CUDA infere
 - Keep long-running jobs durable, with stage checkpoints, cancel/retry/resume, SSE progress, and polling fallback.
 - Produce engine-ready packages with LODs, collision geometry, materials, validation reports, and manifests — Unity by default, Unreal Engine as a per-job opt-in.
 - Detect and rig vehicle wheels into a GLB with Unity `WheelCollider` setup metadata.
+- Create transparent RGBA PNG sprites from a local text prompt or an uploaded PNG/JPEG; HunyForge removes the background, centers the subject with configurable padding, and offers direct Unity-ready downloads. Sprite Studio also packs uploaded animation/directional frames into a sheet plus Unity `Multiple`-sprite metadata, and supports 128×64 or 256×128 2:1 isometric tile canvases.
 - Run locally: input images, models, job data, and artifacts are not sent to a cloud inference service.
 
 ## Requirements
@@ -29,6 +30,7 @@ It combines a React/Three.js UI with a FastAPI job service and local CUDA infere
   - Hunyuan3D-2.1 for image shape generation and PBR texturing.
   - Hunyuan3D-2mv Turbo for native multi-view shape generation (optional unless using Multi view).
   - FLUX.2-klein-4B for text-to-3D and reference-preview features (optional unless using Text).
+  - Qwen-Image-Edit-2511 for reference-guided vehicle-frame editing (optional unless using Vehicle Set → Qwen Edit; approximately 54 GB).
 
 ### Engine targets (optional)
 
@@ -155,6 +157,8 @@ See [`.env.example`](.env.example) for the full supported configuration. The mod
 5. Inspect partial artifacts while a job runs. If a job is interrupted, use restart or resume; a child job retains its lineage and immutable source job.
 6. For vehicle assets, mark/suggest wheels in the **Rig** tab and create a rigged child job. Auto-suggest begins with four conventional wheel markers; add and place markers for additional axles (up to 16 wheels). Download the Unity package when validation passes.
 7. For vegetation assets (trees and large plants), the Unreal package additionally carries wind vertex colors (`COLOR_0`: R = sway weight, G = normalized height), a trunk-only collision capsule when `collision_mode` is `trunk`, and a FLUX-generated leaf-spray atlas (`T_Leaf_*.png`). The packaged setup script applies two-sided foliage materials with vertex-color-weighted wind.
+8. For a 2D isometric asset, open **Sprites**. **Sprite** produces individual transparent props, buildings, vehicle angles, icons, masks, or overlays; **2:1 tile** produces a 128×64 or 256×128 canvas; **Sheet** packs uploaded animation/directional PNG frames into a transparent atlas and downloadable Unity metadata. **Vehicle set** requires eight ordered frames (`N`, `NE`, `E`, `SE`, `S`, `SW`, `W`, `NW`) for intact, damaged, and wrecked states, with optional empty/loaded cargo states; it emits one combined atlas, an individual row PNG for every state, and bottom-pivot Unity mappings. Text sprites require the local FLUX worker; uploaded-image sprites use the local background-removal worker. PSD, Krita, and Aseprite remain the authoring sources: export their layers/frames to PNG before importing them into HunyForge.
+   - In **Vehicle set**, the Qwen Edit section accepts an approved master vehicle image and a direction/state instruction. It produces a reference-guided candidate frame; inspect it, download it, then add it to the corresponding eight-frame state row. Qwen editing is intentionally one frame at a time so poor angle/state edits can be retried without discarding the rest of the set.
 
 ## Engine packages
 

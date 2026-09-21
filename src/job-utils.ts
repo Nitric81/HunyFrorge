@@ -9,7 +9,7 @@ export const API_URL = import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8081';
 
 export type BackendId = 'demo' | 'hunyuan3d-2.1' | 'hunyuan3d-omni';
 export type PresetName = 'draft' | 'standard' | 'final';
-export type InputMode = 'image' | 'multi-image' | 'text' | 'retexture' | 'vehicle-rig';
+export type InputMode = 'image' | 'multi-image' | 'text' | 'retexture' | 'vehicle-rig' | 'sprite';
 export type AssetType = 'generic' | 'character' | 'vehicle' | 'vegetation';
 export type ReferenceView = 'front' | 'rear' | 'left' | 'right' | 'front_left' | 'rear_right' | 'top' | 'bottom';
 
@@ -117,7 +117,7 @@ export interface JobUpdate {
   id: string;
   stage: JobStage;
   progress: number;
-  backend: BackendId;
+  backend: BackendId | 'sprite';
   seed: number;
   texture: boolean;
   preset: PresetName;
@@ -175,6 +175,7 @@ export interface HealthInfo {
   hunyuan_service_ready: boolean;
   workers?: Record<string, { ready?: boolean; busy?: boolean; last_error?: string | null; state?: string }>;
   t2i?: { enabled: boolean; model: string; model_path: string; max_prompt_chars: number };
+  qwen_edit?: { enabled: boolean; model: string; model_path: string; model_present?: boolean };
   multi_view?: { enabled: boolean; adapter_configured: boolean; reason?: string | null };
 }
 
@@ -382,6 +383,80 @@ export function previewReference(payload: ReferencePreviewPayload): Promise<Refe
   return request<ReferencePreview>('/api/reference-preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
 }
 
+export interface SpriteResult {
+  image: string;
+  timings: Record<string, number>;
+  seed: number;
+  size: 256 | 512 | 1024 | 2048;
+  width: number;
+  height: number;
+  has_alpha: boolean;
+  prompt_effective?: string | null;
+}
+
+export interface SpritePayload {
+  prompt?: string | null;
+  image?: string | null;
+  seed: number;
+  size: 256 | 512 | 1024 | 2048;
+  width?: number | null;
+  height?: number | null;
+  padding_percent: number;
+  scaffold?: boolean;
+}
+
+export function createSprite(payload: SpritePayload): Promise<SpriteResult> {
+  return request<SpriteResult>('/api/sprites', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+}
+
+export function submitSpriteJob(payload: SpritePayload & { project_id: string | null }): Promise<JobUpdate> {
+  return request<JobUpdate>('/api/sprite-jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+}
+
+export interface SpriteSheetResult {
+  image: string;
+  has_alpha: boolean;
+  frame_count: number;
+  columns: number;
+  rows: number;
+  frame_width: number;
+  frame_height: number;
+  unity: { sprite_mode: 'Multiple'; pixels_per_unit: number; directions: number; animation: string };
+}
+
+export function createSpriteSheet(payload: { frames: string[]; frame_width: number; frame_height: number; columns: number; directions: number; animation: string }): Promise<SpriteSheetResult> {
+  return request<SpriteSheetResult>('/api/sprite-sheets', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+}
+
+export interface QwenEditResult {
+  image: string;
+  timings: Record<string, number>;
+  seed: number;
+  model: string;
+}
+
+export function qwenEdit(payload: { image: string; prompt: string; seed: number; size: 512 | 768 | 1024; num_inference_steps?: number }): Promise<QwenEditResult> {
+  return request<QwenEditResult>('/api/qwen-edit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+}
+
+export type VehicleSpriteState = 'intact' | 'damaged' | 'wrecked' | 'empty' | 'loaded';
+export type VehicleDirection = 'N' | 'NE' | 'E' | 'SE' | 'S' | 'SW' | 'W' | 'NW';
+
+export interface VehicleSpriteSetResult {
+  image: string;
+  rows: Record<string, string>;
+  has_alpha: boolean;
+  columns: 8;
+  row_count: number;
+  frame_width: number;
+  frame_height: number;
+  unity: { sprite_mode: 'Multiple'; pixels_per_unit: number; pivot: 'Bottom'; directions: VehicleDirection[]; states: VehicleSpriteState[]; sprites: { state: VehicleSpriteState; direction: VehicleDirection; rect: { x: number; y: number; width: number; height: number } }[] };
+}
+
+export function createVehicleSpriteSet(payload: { states: { state: VehicleSpriteState; frames: string[] }[]; frame_width: number; frame_height: number }): Promise<VehicleSpriteSetResult> {
+  return request<VehicleSpriteSetResult>('/api/vehicle-sprite-sets', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+}
+
 export function retextureJob(id: string, payload: { image: string; prompt?: string | null; seed?: number | null; t2i_seed?: number | null; parameters?: Partial<GenerationSettings> }): Promise<JobUpdate> {
   return request<JobUpdate>(`/api/jobs/${id}/retexture`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
 }
@@ -456,6 +531,7 @@ export function inputModeBadge(mode: InputMode | undefined): { label: string; ti
   if (mode === 'multi-image') return { label: 'MULTI', title: 'Multi-view reference set' };
   if (mode === 'retexture') return { label: 'RETEX', title: 'Text-guided retexture' };
   if (mode === 'vehicle-rig') return { label: 'RIG', title: 'Vehicle wheel rig' };
+  if (mode === 'sprite') return { label: 'PNG', title: 'Transparent sprite asset' };
   return null;
 }
 

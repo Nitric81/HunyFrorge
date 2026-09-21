@@ -267,12 +267,28 @@ async function pickFile(ariaLabel: string, file: File, expectAccepted = true) {
 const postJobs = () => calls.filter(call => call.method === 'POST' && /\/api\/jobs$/.test(call.url));
 const jobCalls = (suffix: string) => calls.filter(call => call.method === 'POST' && call.url.endsWith(suffix));
 const previewCalls = () => calls.filter(call => call.method === 'POST' && /\/api\/reference-preview$/.test(call.url));
+const spriteCalls = () => calls.filter(call => call.method === 'POST' && /\/api\/sprites$/.test(call.url));
+const spriteJobCalls = () => calls.filter(call => call.method === 'POST' && /\/api\/sprite-jobs$/.test(call.url));
 
 function enableT2i() {
   route('GET', /\/health$/, () => ({ body: { inference_mode: 'demo', runtime_ready: true, hunyuan_service_ready: true, t2i: { enabled: true, model: 'flux2-klein-4b', model_path: '/models/FLUX.2-klein-4B', max_prompt_chars: 2000 } } }));
 }
 
 describe('App', () => {
+  it('creates and exposes a downloadable transparent sprite', async () => {
+    enableT2i();
+    route('POST', /\/api\/sprite-jobs$/, () => ({ status: 202, body: jobFixture({ id: 'sprite-job', input_mode: 'sprite', backend: 'sprite', texture: false }) }));
+    await mount();
+    await act(async () => { buttonWith('Sprites').click(); });
+    await setText(field('Sprite prompt'), 'a red health potion');
+    await setSelect(field('Output size'), '512');
+    await act(async () => { buttonWith('Create transparent sprite').click(); await settle(); });
+    expect(spriteCalls()).toHaveLength(0);
+    expect(spriteJobCalls()).toHaveLength(1);
+    expect(spriteJobCalls()[0].body).toMatchObject({ project_id: 'proj-1', prompt: 'a red health potion', size: 512, padding_percent: 8 });
+    expect(container.textContent).toContain('sprite-j');
+  });
+
   it('renders preset contract controls and submits every visible setting with seed zero', async () => {
     route('POST', /\/api\/jobs$/, body => {
       const created = jobFixture({ id: 'job-new', parameters: (body as Record<string, unknown>).parameters as Record<string, unknown> });

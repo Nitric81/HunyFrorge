@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 import shutil
 import signal
@@ -19,6 +20,8 @@ from starlette.background import BackgroundTask
 from .models import AppSettings, GenerationSettings
 from .storage import SettingsStore
 from .worker_runtime import RuntimeEngine, memory_snapshot
+
+logger = logging.getLogger(__name__)
 
 
 def _runtime_settings() -> AppSettings:
@@ -67,6 +70,24 @@ class PreviewRequest(BaseModel):
     width: Literal[512, 768, 1024] = 1024
     height: Literal[512, 768, 1024] = 1024
     num_inference_steps: int = Field(default=4, ge=1, le=28)
+
+
+class SpriteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    image: str = Field(min_length=1, max_length=14_000_000)
+    width: int = Field(default=1024, ge=16, le=4096)
+    height: int = Field(default=1024, ge=16, le=4096)
+    padding_percent: int = Field(default=8, ge=0, le=40)
+
+
+class QwenEditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    image: str = Field(min_length=1, max_length=14_000_000)
+    prompt: str = Field(min_length=1, max_length=2000)
+    seed: int = Field(ge=0, le=2**32 - 1)
+    width: Literal[512, 768, 1024] = 1024
+    height: Literal[512, 768, 1024] = 1024
+    num_inference_steps: int = Field(default=40, ge=10, le=80)
 
 
 def stage_isolation_enabled() -> bool:
@@ -144,6 +165,8 @@ async def _spawn_and_collect(kind: str, payload: dict, slot: Path) -> dict:
     if result and result.get("status") == "ok":
         return result
     if result and result.get("status") == "error":
+        if stderr:
+            logger.error("isolated %s stage failed:\n%s", kind, stderr.decode("utf-8", errors="replace").strip())
         raise _stage_error(result)
     tail = (stderr or b"").decode("utf-8", errors="replace")[-1500:].strip()
     if proc.returncode == -getattr(signal, "SIGKILL", 9):
@@ -244,6 +267,83 @@ async def preview(request: PreviewRequest):
         png, records = await asyncio.shield(task)
         timings = {name: round(record.get("elapsed_seconds") or 0, 2) for name, record in records.items()}
         return JSONResponse(content={"image": "data:image/png;base64," + base64.b64encode(png).decode("ascii"), "timings": timings})
+    except asyncio.CancelledError:
+        if task is not None:
+            try:
+                await task
+            except Exception:
+                pass
+        raise
+    except HTTPException:
+        raise
+    except (ValueError, RuntimeError, MemoryError) as e:
+        raise _map_stage_exception(e) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    finally:
+        if engine._worker_lock.locked():
+            engine._worker_lock.release()
+
+
+@app.post("/sprite")
+async def sprite(request: SpriteRequest):
+    engine = get_engine()
+    if not await asyncio.to_thread(engine._worker_lock.acquire, blocking=False):
+        raise HTTPException(status_code=409, detail="Worker busy")
+    task = None
+    try:
+        reason = admission_error()
+        if reason:
+            raise HTTPException(status_code=503, detail=reason)
+        if stage_isolation_enabled():
+            result, slot = await _isolated_stage("sprite", request.model_dump(mode="json"))
+            png = await asyncio.to_thread((Path(result["artifact"])).read_bytes)
+            content = {"image": "data:image/png;base64," + base64.b64encode(png).decode("ascii"), "timings": result.get("timings", {}), "has_alpha": True}
+            return JSONResponse(content=content, background=BackgroundTask(shutil.rmtree, slot, ignore_errors=True))
+        task = asyncio.ensure_future(asyncio.to_thread(engine.generate_sprite, request))
+        png, records = await asyncio.shield(task)
+        timings = {name: round(record.get("elapsed_seconds") or 0, 2) for name, record in records.items()}
+        return {"image": "data:image/png;base64," + base64.b64encode(png).decode("ascii"), "timings": timings, "has_alpha": True}
+    except asyncio.CancelledError:
+        if task is not None:
+            try:
+                await task
+            except Exception:
+                pass
+        raise
+    except HTTPException:
+        raise
+    except (ValueError, RuntimeError, MemoryError) as e:
+        raise _map_stage_exception(e) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    finally:
+        if engine._worker_lock.locked():
+            engine._worker_lock.release()
+
+
+@app.post("/qwen-edit")
+async def qwen_edit(request: QwenEditRequest):
+    engine = get_engine()
+    if not await asyncio.to_thread(engine._worker_lock.acquire, blocking=False):
+        raise HTTPException(status_code=409, detail="Worker busy")
+    task = None
+    try:
+        reason = admission_error()
+        if reason:
+            raise HTTPException(status_code=503, detail=reason)
+        if stage_isolation_enabled():
+            result, slot = await _isolated_stage("qwen-edit", request.model_dump(mode="json"))
+            png = await asyncio.to_thread((Path(result["artifact"])).read_bytes)
+            content = {
+                "image": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
+                "timings": result.get("timings", {}),
+            }
+            return JSONResponse(content=content, background=BackgroundTask(shutil.rmtree, slot, ignore_errors=True))
+        task = asyncio.ensure_future(asyncio.to_thread(engine.generate_qwen_edit, request))
+        png, records = await asyncio.shield(task)
+        timings = {name: round(record.get("elapsed_seconds") or 0, 2) for name, record in records.items()}
+        return {"image": "data:image/png;base64," + base64.b64encode(png).decode("ascii"), "timings": timings}
     except asyncio.CancelledError:
         if task is not None:
             try:

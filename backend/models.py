@@ -122,6 +122,7 @@ def current_model_revision() -> str:
 
 
 T2I_MODEL_ID = "black-forest-labs/FLUX.2-klein-4B"
+QWEN_EDIT_MODEL_ID = "Qwen/Qwen-Image-Edit-2511"
 T2I_SCAFFOLD_GENERATE = "single object, centered, entire object visible, plain neutral studio background, even lighting"
 T2I_SCAFFOLD_EDIT = "keep the same object, shape, pose, and composition; change only the surface material, colors, and finish"
 
@@ -132,6 +133,18 @@ def t2i_config() -> dict:
         "model": T2I_MODEL_ID,
         "model_path": os.getenv("HUNYFORGE_T2I_MODEL_PATH", ""),
         "max_prompt_chars": int(os.getenv("HUNYFORGE_T2I_MAX_PROMPT_CHARS", "2000")),
+    }
+
+
+def qwen_edit_config() -> dict:
+    model_path = os.getenv("HUNYFORGE_QWEN_EDIT_MODEL_PATH", "")
+    return {
+        "enabled": os.getenv("HUNYFORGE_QWEN_EDIT_ENABLED", "0") == "1" and Path(model_path).is_dir(),
+        "model": QWEN_EDIT_MODEL_ID,
+        "model_path": model_path,
+        "model_present": Path(model_path).is_dir(),
+        "quantization": os.getenv("HUNYFORGE_QWEN_EDIT_QUANTIZATION", "4bit"),
+        "gpu_memory": os.getenv("HUNYFORGE_QWEN_EDIT_GPU_MEMORY", "14GiB"),
     }
 
 
@@ -251,7 +264,7 @@ class JobStatus(BaseModel):
     preset: Literal["draft", "standard", "final"] = "standard"
     parent_job_id: UUID | None = None
     resume_from: Literal["shape", "texture", "rig", "unity", "validation"] | None = None
-    input_mode: Literal["image", "multi-image", "text", "retexture", "vehicle-rig"] = "image"
+    input_mode: Literal["image", "multi-image", "text", "retexture", "vehicle-rig", "sprite"] = "image"
     prompt: str | None = None
     t2i_seed: int | None = None
     t2i_model: str | None = None
@@ -287,7 +300,7 @@ class JobCreate(BaseModel):
     reference_images: list[ReferenceImage] = Field(default_factory=list, max_length=8)
     control_type: str | None = Field(default=None, pattern="^(point|voxel|pose|bbox)$")
     control_data: str | None = None
-    input_mode: Literal["image", "multi-image", "text", "retexture", "vehicle-rig"] = "image"
+    input_mode: Literal["image", "multi-image", "text", "retexture", "vehicle-rig", "sprite"] = "image"
     prompt: str | None = Field(default=None, max_length=2000)
     t2i_seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
     asset_type: Literal["generic", "character", "vehicle", "vegetation"] = "generic"
@@ -351,6 +364,7 @@ class HealthResponse(BaseModel):
     workers: dict[str, Any] = Field(default_factory=dict)
     runtime_config: dict[str, Any] = Field(default_factory=dict)
     t2i: dict[str, Any] = Field(default_factory=dict)
+    qwen_edit: dict[str, Any] = Field(default_factory=dict)
     multi_view: dict[str, Any] = Field(default_factory=dict)
 
 

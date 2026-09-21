@@ -23,6 +23,9 @@ import {
   VehicleWheel,
   artifactUrl,
   controlFileError,
+  createSpriteSheet,
+  createVehicleSpriteSet,
+  submitSpriteJob,
   createProject,
   deleteJob,
   describeError,
@@ -40,9 +43,13 @@ import {
   jobAction,
   presetEstimate,
   previewReference,
+  qwenEdit,
   readFileAsDataUrl,
   readyArtifactNames,
   ReferencePreview,
+  SpriteResult,
+  SpriteSheetResult,
+  VehicleSpriteSetResult,
   retextureJob,
   rigJob,
   selectPreviewName,
@@ -106,7 +113,7 @@ function App() {
   const [referenceLoading, setReferenceLoading] = useState<Partial<Record<ReferenceView, boolean>>>({});
   const [menuOpen, setMenuOpen] = useState(false);
   const [mobile, setMobile] = useState(() => typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 640px)').matches);
-  const [activeTab, setActiveTab] = useState<'generate' | 'edit' | 'rig' | 'unity'>('generate');
+  const [activeTab, setActiveTab] = useState<'generate' | 'sprite' | 'edit' | 'rig' | 'unity'>('generate');
   const [assetType, setAssetType] = useState<AssetType>('generic');
   const [inputMode, setInputMode] = useState<'image' | 'text'>('image');
   const [promptText, setPromptText] = useState('');
@@ -114,6 +121,17 @@ function App() {
   const [t2iSeed, setT2iSeed] = useState('48291');
   const [refPreview, setRefPreview] = useState<ReferencePreview | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
+  const [spriteMode, setSpriteMode] = useState<'text' | 'image'>('text');
+  const [spriteWorkflow, setSpriteWorkflow] = useState<'sprite' | 'tile' | 'sheet' | 'vehicle'>('sprite');
+  const [spritePrompt, setSpritePrompt] = useState('');
+  const [spriteImage, setSpriteImage] = useState<string | null>(null);
+  const [spriteImageName, setSpriteImageName] = useState('');
+  const [spriteSeed, setSpriteSeed] = useState('48291');
+  const [spriteSize, setSpriteSize] = useState<256 | 512 | 1024 | 2048>(1024);
+  const [spritePadding, setSpritePadding] = useState('8');
+  const [spriteResult, setSpriteResult] = useState<SpriteResult | null>(null);
+  const [spriteBusy, setSpriteBusy] = useState(false);
+  const [spriteError, setSpriteError] = useState<string | null>(null);
   const [t2iEnabled, setT2iEnabled] = useState(false);
   const [multiView, setMultiView] = useState({ enabled: false, adapter_configured: false, reason: '' as string | null });
   const [editPrompt, setEditPrompt] = useState('');
@@ -455,6 +473,59 @@ function App() {
     }
   }
 
+  async function onSpriteImageChange(file?: File) {
+    if (!file) return;
+    const problem = imageFileError(file);
+    if (problem) {
+      setSpriteImage(null);
+      setSpriteImageName('');
+      setSpriteError(problem);
+      return;
+    }
+    try {
+      setSpriteImage(await readFileAsDataUrl(file));
+      setSpriteImageName(file.name);
+      setSpriteResult(null);
+      setSpriteError(null);
+    } catch {
+      setSpriteError('Could not read the source image');
+    }
+  }
+
+  async function generateSprite() {
+    if (spriteBusy) return;
+    if (spriteMode === 'text' && !spritePrompt.trim()) {
+      setSpriteError('Enter a prompt before generating a sprite');
+      return;
+    }
+    if (spriteMode === 'image' && !spriteImage) {
+      setSpriteError('Choose a PNG or JPEG source image');
+      return;
+    }
+    setSpriteBusy(true);
+    setSpriteError(null);
+    try {
+      const dimensions = spriteWorkflow === 'tile' ? (spriteSize === 256 ? { width: 128, height: 64 } : { width: 256, height: 128 }) : { width: spriteSize, height: spriteSize };
+      const created = await submitSpriteJob({
+        project_id: projectId || null,
+        prompt: spriteMode === 'text' ? spritePrompt.trim() : null,
+        image: spriteMode === 'image' ? spriteImage : null,
+        seed: Number(spriteSeed),
+        size: spriteSize,
+        ...dimensions,
+        padding_percent: Number(spritePadding),
+        scaffold: true,
+      });
+      setJobId(created.id);
+      setJob(created);
+      setJobs(current => [created, ...current.filter(entry => entry.id !== created.id)]);
+    } catch (caught) {
+      setSpriteError(describeError(caught));
+    } finally {
+      setSpriteBusy(false);
+    }
+  }
+
   async function generateEditPreview() {
     if (!job || editBusy) return;
     const trimmed = editPrompt.trim();
@@ -743,7 +814,7 @@ function App() {
           </div>
         </section>
         <aside className="inspector">
-          <div className="tabs"><button className={activeTab === 'generate' ? 'tab active' : 'tab'} onClick={() => setActiveTab('generate')}>Generate</button><button className={activeTab === 'edit' ? 'tab active' : 'tab'} onClick={() => setActiveTab('edit')}>Edit</button><button className={`tab ${activeTab === 'rig' ? 'active' : ''} ${job?.asset_type === 'vehicle' || job?.input_mode === 'vehicle-rig' ? '' : 'disabled'}`} onClick={() => setActiveTab('rig')}>Rig</button><button className={activeTab === 'unity' ? 'tab active' : 'tab'} onClick={() => setActiveTab('unity')}>Engine export</button></div>
+          <div className="tabs"><button className={activeTab === 'generate' ? 'tab active' : 'tab'} onClick={() => setActiveTab('generate')}>Generate</button><button className={activeTab === 'sprite' ? 'tab active' : 'tab'} onClick={() => setActiveTab('sprite')}>Sprites</button><button className={activeTab === 'edit' ? 'tab active' : 'tab'} onClick={() => setActiveTab('edit')}>Edit</button><button className={`tab ${activeTab === 'rig' ? 'active' : ''} ${job?.asset_type === 'vehicle' || job?.input_mode === 'vehicle-rig' ? '' : 'disabled'}`} onClick={() => setActiveTab('rig')}>Rig</button><button className={activeTab === 'unity' ? 'tab active' : 'tab'} onClick={() => setActiveTab('unity')}>Engine export</button></div>
           {activeTab === 'generate' ? (
             <form className="inspector-body" ref={formRef} onSubmit={onSubmit}>
               <div className="section-heading"><div><h2>New generation</h2><p>Stage a local asset run</p></div><span className="pill teal">LOCAL</span></div>
@@ -868,6 +939,8 @@ function App() {
               {error ? <p className="error-text" role="alert">{error}</p> : null}
               <button type="submit" className="primary-button full" disabled={submitting || busy || !settings || uploadPending || Boolean(settingsProblem) || (inputMode === 'text' && !refPreview) || (inputMode === 'image' && referenceMode === 'multi' && (REQUIRED_REFERENCE_VIEWS.some(item => !referenceImages[item.view]) || (runtime === 'hunyuan' && !multiView.enabled)))}><Sparkles size={16} />{submitting ? 'Submitting…' : uploadPending ? 'Reading upload…' : busy ? 'Worker busy' : inputMode === 'text' && !refPreview ? 'Generate a reference first' : inputMode === 'image' && referenceMode === 'multi' && REQUIRED_REFERENCE_VIEWS.some(item => !referenceImages[item.view]) ? 'Add required views' : inputMode === 'image' && referenceMode === 'multi' && runtime === 'hunyuan' && !multiView.enabled ? 'Configure multi-view adapter' : 'Generate asset'}</button>
             </form>
+          ) : activeTab === 'sprite' ? (
+            <SpritePanel workflow={spriteWorkflow} onWorkflowChange={setSpriteWorkflow} mode={spriteMode} onModeChange={setSpriteMode} prompt={spritePrompt} onPromptChange={value => { setSpritePrompt(value); setSpriteResult(null); }} imageName={spriteImageName} onImageChange={file => void onSpriteImageChange(file)} seed={spriteSeed} onSeedChange={value => { setSpriteSeed(value); setSpriteResult(null); }} size={spriteSize} onSizeChange={setSpriteSize} padding={spritePadding} onPaddingChange={value => { setSpritePadding(value); setSpriteResult(null); }} result={spriteResult} spriteJob={job?.input_mode === 'sprite' ? job : null} busy={spriteBusy} error={spriteError} t2iEnabled={t2iEnabled} onGenerate={() => void generateSprite()} />
           ) : activeTab === 'edit' ? (
             <EditPanel job={job} ready={ready} t2iEnabled={t2iEnabled} prompt={editPrompt} onPromptChange={value => { setEditPrompt(value); setEditPreview(null); }} seed={editSeed} onSeedChange={value => { setEditSeed(value); setEditPreview(null); }} scaffold={scaffold} onScaffoldChange={setScaffold} preview={editPreview} busy={editBusy} error={editError} actionPending={actionPending} workerBusy={workerBusy} onPreview={() => void generateEditPreview()} onApply={() => void applyRetexture()} />
           ) : activeTab === 'rig' ? (
@@ -879,8 +952,7 @@ function App() {
             <UnityPanel job={job} ready={ready} report={validationReport} onResume={() => void runAction('resume')} />
           )}
         </aside>
-      </div>
-      <section className="activity-panel" aria-live="polite">
+        <section className="activity-panel" aria-live="polite">
         <div className="activity-header">
           <div><span className="eyebrow">JOB ACTIVITY</span><strong>{error || connectionState !== 'live' ? (error ?? (connectionState === 'down' ? 'Lost connection to local job stream; retrying status checks…' : 'Live updates degraded — polling job status every 5 seconds.')) : previewBusy || editBusy ? 'Generating reference image (FLUX.2 Klein)…' : job ? (STAGE_LABELS[job.stage] ?? job.stage) : 'Ready for generation'}</strong>{job?.current_operation ? <span className="muted small">Operation: {job.current_operation.replace(/_/g, ' ')}{operationStepText(job.operation_progress)}</span> : null}</div>
           <div className="activity-actions">
@@ -898,7 +970,8 @@ function App() {
           {STAGE_ROWS.map(row => <StageRow key={row.key} row={row} job={job} />)}
         </div>
         {job?.failed_stage ? <p className="error-text">Failed stage: {job.failed_stage}. Preserved artifacts remain downloadable above; {job.error_message}</p> : job?.error_message ? <p className="error-text">{job.error_message}</p> : null}
-      </section>
+        </section>
+      </div>
     </main>
     {menuOpen && <button className="menu-overlay" onClick={() => setMenuOpen(false)} aria-label="Close menu" />}
     <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} presets={contract} health={health} onSaved={saved => applyAppSettings(saved)} />
@@ -924,6 +997,155 @@ function StageRow({ row, job }: { row: { key: StageName; label: string }; job: J
       <span className="stage-elapsed">{record ? formatElapsed(live) : '—'}</span>
     </div>
   );
+}
+
+interface SpritePanelProps {
+  workflow: 'sprite' | 'tile' | 'sheet' | 'vehicle'; onWorkflowChange: (value: 'sprite' | 'tile' | 'sheet' | 'vehicle') => void;
+  mode: 'text' | 'image'; onModeChange: (value: 'text' | 'image') => void;
+  prompt: string; onPromptChange: (value: string) => void;
+  imageName: string; onImageChange: (file?: File) => void;
+  seed: string; onSeedChange: (value: string) => void;
+  size: 256 | 512 | 1024 | 2048; onSizeChange: (value: 256 | 512 | 1024 | 2048) => void;
+  padding: string; onPaddingChange: (value: string) => void;
+  result: SpriteResult | null; spriteJob: JobUpdate | null; busy: boolean; error: string | null; t2iEnabled: boolean; onGenerate: () => void;
+}
+
+function SpritePanel({ workflow, onWorkflowChange, mode, onModeChange, prompt, onPromptChange, imageName, onImageChange, seed, onSeedChange, size, onSizeChange, padding, onPaddingChange, result, spriteJob, busy, error, t2iEnabled, onGenerate }: SpritePanelProps) {
+  const [sheetFrames, setSheetFrames] = useState<string[]>([]);
+  const [sheetNames, setSheetNames] = useState<string[]>([]);
+  const [sheetResult, setSheetResult] = useState<SpriteSheetResult | null>(null);
+  const [sheetError, setSheetError] = useState<string | null>(null);
+  const [sheetBusy, setSheetBusy] = useState(false);
+  const [sheetColumns, setSheetColumns] = useState('4');
+  const [sheetAnimation, setSheetAnimation] = useState('idle');
+  const [vehicleFrames, setVehicleFrames] = useState<Record<string, string[]>>({});
+  const [vehicleResult, setVehicleResult] = useState<VehicleSpriteSetResult | null>(null);
+  const [vehicleError, setVehicleError] = useState<string | null>(null);
+  const [vehicleBusy, setVehicleBusy] = useState(false);
+  const [vehicleCargo, setVehicleCargo] = useState<'none' | 'empty' | 'loaded' | 'both'>('none');
+  const [qwenMaster, setQwenMaster] = useState<string | null>(null);
+  const [qwenMasterName, setQwenMasterName] = useState('');
+  const [qwenPrompt, setQwenPrompt] = useState('Show this exact vehicle from the north-east isometric direction. Preserve the vehicle identity, proportions, paint, accessories, and scale. Transparent or plain background.');
+  const [qwenResult, setQwenResult] = useState<string | null>(null);
+  const [qwenBusy, setQwenBusy] = useState(false);
+  const [qwenError, setQwenError] = useState<string | null>(null);
+  const canGenerate = !busy && (mode === 'text' ? Boolean(prompt.trim() && t2iEnabled) : Boolean(imageName));
+  async function addSheetFrames(files?: FileList | null) {
+    if (!files?.length) return;
+    const selected = Array.from(files).slice(0, 64 - sheetFrames.length);
+    const invalid = selected.find(file => imageFileError(file));
+    if (invalid) { setSheetError(imageFileError(invalid)); return; }
+    try {
+      const images = await Promise.all(selected.map(readFileAsDataUrl));
+      setSheetFrames(current => [...current, ...images]);
+      setSheetNames(current => [...current, ...selected.map(file => file.name)]);
+      setSheetResult(null); setSheetError(null);
+    } catch { setSheetError('Could not read one or more animation frames'); }
+  }
+  async function buildSheet() {
+    if (!sheetFrames.length || sheetBusy) return;
+    setSheetBusy(true); setSheetError(null);
+    try {
+      setSheetResult(await createSpriteSheet({ frames: sheetFrames, frame_width: size, frame_height: size, columns: Number(sheetColumns), directions: Math.min(8, Number(sheetColumns)), animation: sheetAnimation.trim() || 'idle' }));
+    } catch (caught) { setSheetError(describeError(caught)); } finally { setSheetBusy(false); }
+  }
+  const vehicleStates = ['intact', 'damaged', 'wrecked', ...(vehicleCargo === 'empty' || vehicleCargo === 'both' ? ['empty'] : []), ...(vehicleCargo === 'loaded' || vehicleCargo === 'both' ? ['loaded'] : [])] as const;
+  async function addVehicleFrames(state: string, files?: FileList | null) {
+    if (!files?.length) return;
+    const selected = Array.from(files);
+    if (selected.length !== 8) { setVehicleError(`${state} needs exactly 8 frames, ordered N, NE, E, SE, S, SW, W, NW`); return; }
+    const invalid = selected.find(file => imageFileError(file));
+    if (invalid) { setVehicleError(imageFileError(invalid)); return; }
+    try {
+      const images = await Promise.all(selected.map(readFileAsDataUrl));
+      setVehicleFrames(current => ({ ...current, [state]: images }));
+      setVehicleResult(null); setVehicleError(null);
+    } catch { setVehicleError(`Could not read ${state} frames`); }
+  }
+  async function buildVehicleSet() {
+    if (vehicleBusy || vehicleStates.some(state => vehicleFrames[state]?.length !== 8)) return;
+    setVehicleBusy(true); setVehicleError(null);
+    try { setVehicleResult(await createVehicleSpriteSet({ states: vehicleStates.map(state => ({ state, frames: vehicleFrames[state] })) as Parameters<typeof createVehicleSpriteSet>[0]['states'], frame_width: size, frame_height: size })); } catch (caught) { setVehicleError(describeError(caught)); } finally { setVehicleBusy(false); }
+  }
+  async function chooseQwenMaster(file?: File) {
+    if (!file) return;
+    const problem = imageFileError(file);
+    if (problem) { setQwenError(problem); return; }
+    try { setQwenMaster(await readFileAsDataUrl(file)); setQwenMasterName(file.name); setQwenResult(null); setQwenError(null); } catch { setQwenError('Could not read the master vehicle image'); }
+  }
+  async function generateQwenFrame() {
+    if (!qwenMaster || !qwenPrompt.trim() || qwenBusy) return;
+    setQwenBusy(true); setQwenError(null);
+    try {
+      const output = await qwenEdit({ image: qwenMaster, prompt: qwenPrompt.trim(), seed: Number(seed), size: size === 256 ? 512 : size === 2048 ? 1024 : size });
+      setQwenResult(output.image);
+    } catch (caught) { setQwenError(describeError(caught)); } finally { setQwenBusy(false); }
+  }
+  return <div className="inspector-body sprite-panel">
+    <div className="section-heading"><div><h2>Sprite Studio</h2><p>Transparent PNGs for Unity isometric games</p></div><span className="pill teal">RGBA</span></div>
+    <div className="vram-callout"><ImagePlus size={17} /><div><strong>Alpha-ready output</strong><p>Subjects are background-removed, tightly cropped, centered on a square transparent canvas, and exported as PNG.</p></div></div>
+    <div className="segmented" role="group" aria-label="Sprite workflow"><button type="button" className={workflow === 'sprite' ? 'selected' : ''} onClick={() => onWorkflowChange('sprite')}>Sprite</button><button type="button" className={workflow === 'tile' ? 'selected' : ''} onClick={() => onWorkflowChange('tile')}>2:1 tile</button><button type="button" className={workflow === 'sheet' ? 'selected' : ''} onClick={() => onWorkflowChange('sheet')}>Sheet</button><button type="button" className={workflow === 'vehicle' ? 'selected' : ''} onClick={() => onWorkflowChange('vehicle')}>Vehicle set</button></div>
+    {workflow === 'vehicle' ? <>
+      <div className="vram-callout"><Box size={17} /><div><strong>Fixed 8-direction contract</strong><p>Upload each state in exact order: N, NE, E, SE, S, SW, W, NW. The combined atlas uses states as rows and directions as columns.</p></div></div>
+      <details className="advanced" open><summary>Generate a frame from a master vehicle with Qwen Edit</summary>
+        <div className="field-label"><strong>Reference-guided editing</strong><span className="field-hint">Use one approved master image, then edit it into each direction or damage/cargo state. Review and download every result before adding it to a state row.</span></div>
+        <label className="field-label">Master vehicle image<div className="upload-box"><ImagePlus size={20} /><strong>{qwenMasterName || 'Choose master PNG/JPG'}</strong><span>One approved vehicle reference</span><input type="file" accept="image/png,image/jpeg" aria-label="Qwen master vehicle image" onChange={event => void chooseQwenMaster(event.target.files?.[0])} /></div></label>
+        <label className="field-label">Edit instruction<textarea className="prompt-area" rows={4} maxLength={2000} value={qwenPrompt} onChange={event => setQwenPrompt(event.target.value)} /><span className="field-hint">Example: “Show this exact vehicle from the south-west isometric direction; preserve every design detail.”</span></label>
+        {qwenError ? <p className="error-text" role="alert">{qwenError}</p> : null}
+        <button type="button" className="ghost-button full" disabled={!qwenMaster || !qwenPrompt.trim() || qwenBusy} onClick={() => void generateQwenFrame()}>{qwenBusy ? <LoaderCircle size={15} /> : <Sparkles size={15} />}{qwenBusy ? 'Qwen is editing the frame…' : 'Generate reference-guided frame'}</button>
+        {qwenResult ? <figure className="sprite-preview"><img src={qwenResult} alt="Reference-guided Qwen vehicle edit" /><figcaption className="ref-meta"><span>Review this direction/state before packing</span></figcaption><a className="ghost-button full" href={qwenResult} download="hunyforge-qwen-vehicle-frame.png"><Download size={15} />Download frame</a></figure> : null}
+      </details>
+      <label className="field-label">Frame size<select value={size} onChange={event => onSizeChange(Number(event.target.value) as 256 | 512 | 1024 | 2048)}><option value={256}>256 × 256</option><option value={512}>512 × 512</option><option value={1024}>1024 × 1024</option></select></label>
+      <label className="field-label">Cargo states<select value={vehicleCargo} onChange={event => { setVehicleCargo(event.target.value as 'none' | 'empty' | 'loaded' | 'both'); setVehicleResult(null); }}><option value="none">No cargo variant</option><option value="empty">Empty cargo</option><option value="loaded">Loaded cargo</option><option value="both">Empty and loaded</option></select></label>
+      {vehicleStates.map(state => <label className="field-label" key={state}>{state} — 8 directions
+        <div className="upload-box"><Layers3 size={20} /><strong>{vehicleFrames[state]?.length === 8 ? '8 frames ready' : 'Choose 8 ordered frames'}</strong><span>N, NE, E, SE, S, SW, W, NW</span><input type="file" multiple accept="image/png,image/jpeg" aria-label={`${state} vehicle frames`} onChange={event => void addVehicleFrames(state, event.target.files)} /></div>
+      </label>)}
+      {vehicleError ? <p className="error-text" role="alert">{vehicleError}</p> : null}
+      <button type="button" className="primary-button full" disabled={vehicleBusy || vehicleStates.some(state => vehicleFrames[state]?.length !== 8)} onClick={() => void buildVehicleSet()}>{vehicleBusy ? <LoaderCircle size={16} /> : <Box size={16} />}{vehicleBusy ? 'Packing vehicle set…' : 'Create vehicle atlas'}</button>
+      {vehicleResult ? <figure className="sprite-preview"><img src={vehicleResult.image} alt="Combined eight-direction vehicle sprite atlas" /><figcaption className="ref-meta"><span>{vehicleResult.columns} directions × {vehicleResult.row_count} states</span><span>Bottom pivot · transparent PNG</span></figcaption><a className="ghost-button full" href={vehicleResult.image} download="hunyforge-vehicle-atlas.png"><Download size={15} />Download combined atlas</a>{Object.entries(vehicleResult.rows).map(([state, image]) => <a key={state} className="ghost-button full" href={image} download={`hunyforge-vehicle-${state}.png`}><Download size={15} />Download {state} row</a>)}<a className="ghost-button full" href={`data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(vehicleResult.unity, null, 2))}`} download="hunyforge-vehicle-unity.json"><Download size={15} />Download Unity mapping</a></figure> : null}
+    </> : null}
+    {workflow === 'sheet' ? <>
+      <label className="field-label">Animation / directional frames
+        <div className="upload-box"><Layers3 size={20} /><strong>{sheetFrames.length ? `${sheetFrames.length} frames selected` : 'Drop PNG/JPG frames here'}</strong><span>Upload in sheet order · up to 64 frames</span><input type="file" multiple accept="image/png,image/jpeg" aria-label="Sprite sheet frames" onChange={event => void addSheetFrames(event.target.files)} /></div>
+      </label>
+      {sheetNames.length ? <p className="field-hint">{sheetNames.join(', ')}</p> : null}
+      <div className="field-row"><label className="field-label">Frame size<select value={size} onChange={event => onSizeChange(Number(event.target.value) as 256 | 512 | 1024 | 2048)}><option value={256}>256 × 256</option><option value={512}>512 × 512</option><option value={1024}>1024 × 1024</option></select></label><label className="field-label">Columns<input type="number" min={1} max={16} value={sheetColumns} onChange={event => setSheetColumns(event.target.value)} /></label></div>
+      <label className="field-label">Animation name<input value={sheetAnimation} maxLength={64} onChange={event => setSheetAnimation(event.target.value)} /></label>
+      {sheetError ? <p className="error-text" role="alert">{sheetError}</p> : null}
+      <button type="button" className="primary-button full" disabled={!sheetFrames.length || sheetBusy} onClick={() => void buildSheet()}>{sheetBusy ? <LoaderCircle size={16} /> : <Layers3 size={16} />}{sheetBusy ? 'Packing sprite sheet…' : 'Pack Unity sprite sheet'}</button>
+      {sheetResult ? <figure className="sprite-preview"><img src={sheetResult.image} alt="Transparent Unity sprite sheet" /><figcaption className="ref-meta"><span>{sheetResult.frame_count} frames · {sheetResult.columns} columns</span><span>Unity: Multiple sprites</span></figcaption><a className="ghost-button full" href={sheetResult.image} download={`hunyforge-${sheetResult.unity.animation}-sheet.png`}><Download size={15} />Download sprite sheet</a><a className="ghost-button full" href={`data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(sheetResult.unity, null, 2))}`} download={`hunyforge-${sheetResult.unity.animation}-unity.json`}><Download size={15} />Download Unity metadata</a></figure> : null}
+    </> : workflow === 'vehicle' ? null : <>
+    <div className="segmented" role="group" aria-label="Sprite source">
+      <button type="button" className={mode === 'text' ? 'selected' : ''} disabled={!t2iEnabled} title={t2iEnabled ? 'Create a sprite from a local text-to-image reference' : 'Requires the local FLUX T2I worker'} onClick={() => onModeChange('text')}><Type size={13} />Text</button>
+      <button type="button" className={mode === 'image' ? 'selected' : ''} onClick={() => onModeChange('image')}><Upload size={13} />Image</button>
+    </div>
+    {mode === 'text' ? <label className="field-label">Sprite prompt
+      <textarea className="prompt-area" rows={4} maxLength={2000} placeholder="e.g. a top-down red health potion, single object" value={prompt} onChange={event => onPromptChange(event.target.value)} />
+      <span className="field-hint">Describe one object with a clear silhouette; local FLUX creates the source, then HunyForge removes its background.</span>
+    </label> : <label className="field-label">Source image
+      <div className="upload-box"><ImagePlus size={20} /><strong>{imageName || 'Drop an image here'}</strong><span>PNG, JPG · up to 10 MB</span><input type="file" accept="image/png,image/jpeg" aria-label="Sprite source image" onChange={event => onImageChange(event.target.files?.[0])} /></div>
+    </label>}
+    <div className="field-row">
+      <label className="field-label">Output size
+        <select value={size} onChange={event => onSizeChange(Number(event.target.value) as 256 | 512 | 1024 | 2048)}>{workflow === 'tile' ? <><option value={256}>128 × 64 tile</option><option value={512}>256 × 128 tile</option></> : <><option value={256}>256 × 256</option><option value={512}>512 × 512</option><option value={1024}>1024 × 1024</option><option value={2048}>2048 × 2048</option></>}</select>
+      </label>
+      <label className="field-label">Canvas padding
+        <input type="number" min={0} max={40} step={1} value={padding} onChange={event => onPaddingChange(event.target.value)} /><span className="field-hint">0–40%</span>
+      </label>
+    </div>
+    <label className="field-label">Seed
+      <input type="number" min={0} max={4294967295} step={1} value={seed} onChange={event => onSeedChange(event.target.value)} />
+    </label>
+    {error ? <p className="error-text" role="alert">{error}</p> : null}
+    <button type="button" className="primary-button full" disabled={!canGenerate} onClick={onGenerate}>{busy ? <LoaderCircle size={16} /> : <Sparkles size={16} />}{busy ? 'Creating transparent PNG…' : 'Create transparent sprite'}</button>
+    {spriteJob && !isTerminalStage(spriteJob.stage) ? <div className="vram-callout"><LoaderCircle size={17} /><div><strong>Saving to project · {spriteJob.progress}%</strong><p>{spriteJob.current_operation?.replace(/_/g, ' ') ?? 'Preparing sprite asset'}</p></div></div> : null}
+    {spriteJob?.stage === 'complete' ? <div className="vram-callout"><CheckCircle2 size={17} /><div><strong>Saved to project assets</strong><p>Use the artifact links above to download <code>sprite.png</code> and its metadata.</p></div></div> : null}
+    {result ? <figure className="sprite-preview">
+      <img src={result.image} alt="Generated transparent game sprite" />
+      <figcaption className="ref-meta"><span>{result.width} × {result.height} · transparent alpha</span><span>seed {result.seed}</span></figcaption>
+      <a className="ghost-button full" href={result.image} download={`hunyforge-sprite-${result.seed}.png`}><Download size={15} />Download PNG for Unity</a>
+    </figure> : null}</>}
+  </div>;
 }
 
 function UnityPanel({ job, ready, report, onResume }: { job: JobUpdate | null; ready: string[]; report: ValidationReport | null; onResume: () => void }) {

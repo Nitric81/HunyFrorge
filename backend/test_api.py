@@ -198,6 +198,78 @@ class TextFeatureTests(unittest.TestCase):
             self.assertEqual(client.post("/api/reference-preview", json={"prompt": ""}).status_code, 422)
             self.assertEqual(client.post("/api/reference-preview", json={"prompt": "x" * 2001}).status_code, 422)
 
+    def test_sprite_demo_returns_square_transparent_png(self):
+        import base64
+        from io import BytesIO
+        from PIL import Image
+
+        with TestClient(main.app) as client:
+            response = client.post("/api/sprites", json={"prompt": "a red potion", "seed": 5, "size": 256, "padding_percent": 8})
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["has_alpha"])
+        image = Image.open(BytesIO(base64.b64decode(body["image"].split(",", 1)[1]))).convert("RGBA")
+        self.assertEqual(image.size, (256, 256))
+        self.assertEqual(image.getpixel((0, 0))[3], 0)
+        self.assertGreater(image.getpixel((128, 128))[3], 0)
+
+    def test_sprite_requires_exactly_one_source(self):
+        with TestClient(main.app) as client:
+            self.assertEqual(client.post("/api/sprites", json={"seed": 5}).status_code, 422)
+            self.assertEqual(client.post("/api/sprites", json={"prompt": "potion", "image": SAMPLE_PNG_B64, "seed": 5}).status_code, 422)
+
+    def test_sprite_demo_supports_2_to_1_isometric_canvas(self):
+        import base64
+        from io import BytesIO
+        from PIL import Image
+
+        with TestClient(main.app) as client:
+            response = client.post("/api/sprites", json={"prompt": "cobblestone ground tile", "seed": 5, "size": 256, "width": 128, "height": 64})
+        self.assertEqual(response.status_code, 200, response.text)
+        image = Image.open(BytesIO(base64.b64decode(response.json()["image"].split(",", 1)[1])))
+        self.assertEqual(image.size, (128, 64))
+
+    def test_sprite_job_persists_artifacts_in_its_project(self):
+        with TestClient(main.app) as client:
+            project = client.post("/api/projects", json={"name": "Sprites"}).json()
+            response = client.post("/api/sprite-jobs", json={"project_id": project["id"], "prompt": "a red potion", "seed": 5, "size": 256, "padding_percent": 8})
+            self.assertEqual(response.status_code, 202, response.text)
+            job_id = response.json()["id"]
+            for _ in range(100):
+                job = client.get(f"/api/jobs/{job_id}").json()
+                if job["stage"] in ("complete", "failed"):
+                    break
+                time.sleep(0.01)
+        self.assertEqual(job["stage"], "complete", job)
+        self.assertEqual(job["project_id"], project["id"])
+        self.assertEqual(job["input_mode"], "sprite")
+        self.assertIn("artifacts/sprite.png", job["artifacts"])
+        self.assertIn("artifacts/sprite-metadata.json", job["artifacts"])
+
+    def test_sprite_sheet_packs_transparent_frames_and_unity_metadata(self):
+        source = "data:image/png;base64," + SAMPLE_PNG_B64
+        with TestClient(main.app) as client:
+            response = client.post("/api/sprite-sheets", json={"frames": [source, source], "frame_width": 32, "frame_height": 32, "columns": 2, "directions": 2, "animation": "walk"})
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual((body["columns"], body["rows"], body["frame_count"]), (2, 1, 2))
+        self.assertTrue(body["has_alpha"])
+        self.assertEqual(body["unity"], {"sprite_mode": "Multiple", "pixels_per_unit": 32, "directions": 2, "animation": "walk"})
+
+    def test_vehicle_set_requires_core_states_and_packs_eight_directions(self):
+        source = "data:image/png;base64," + SAMPLE_PNG_B64
+        states = [{"state": state, "frames": [source] * 8} for state in ("intact", "damaged", "wrecked", "loaded")]
+        with TestClient(main.app) as client:
+            missing = client.post("/api/vehicle-sprite-sets", json={"states": states[:2], "frame_width": 32, "frame_height": 32})
+            response = client.post("/api/vehicle-sprite-sets", json={"states": states, "frame_width": 32, "frame_height": 32})
+        self.assertEqual(missing.status_code, 422)
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual((body["columns"], body["row_count"]), (8, 4))
+        self.assertEqual(set(body["rows"]), {"intact", "damaged", "wrecked", "loaded"})
+        self.assertEqual(len(body["unity"]["sprites"]), 32)
+        self.assertEqual(body["unity"]["sprites"][0], {"state": "intact", "direction": "N", "rect": {"x": 0, "y": 0, "width": 32, "height": 32}})
+
     def test_job_create_text_mode_records_provenance(self):
         with TestClient(main.app) as client:
             response = client.post("/api/jobs", json={"backend": "demo", "input_mode": "text", "prompt": "a castle", "t2i_seed": 9})

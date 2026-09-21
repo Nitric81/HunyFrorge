@@ -15,7 +15,7 @@ from uuid import UUID
 
 from fastapi.testclient import TestClient
 
-from .hunyuan_worker import MeshToken, PreviewRequest, WorkerRequest, app, generate, get_engine
+from .hunyuan_worker import MeshToken, PreviewRequest, QwenEditRequest, WorkerRequest, app, generate, get_engine
 from .models import GenerationSettings, JobStage, JobStatus, load_generation_presets
 from .storage import sha256_file
 from .worker_runtime import RuntimeEngine
@@ -33,16 +33,33 @@ class FakeImage:
     def open(cls, stream):
         return cls(512, 512, "PNG")
 
-    def __init__(self, width, height, fmt):
+    def __init__(self, width, height, fmt, mode="RGBA"):
         self.width = width
         self.height = height
         self.format = fmt
+        self.mode = mode
+
+    @property
+    def size(self):
+        return (self.width, self.height)
+
+    @classmethod
+    def new(cls, mode, size, color):
+        return cls(size[0], size[1], None, mode)
 
     def load(self):
         pass
 
     def convert(self, mode):
+        self.mode = mode
         return self
+
+    def getchannel(self, name):
+        return self
+
+    def paste(self, image, mask=None):
+        self.pasted_image = image
+        self.pasted_mask = mask
 
 
 class FakeCUDA:
@@ -265,6 +282,28 @@ class FakeT2IFactory:
         return pipeline
 
 
+class FakeQwenPipeline(FakeT2IPipeline):
+    def enable_sequential_cpu_offload(self):
+        self.offloaded = True
+
+
+class FakeQwenFactory:
+    instances = []
+    from_pretrained_calls = []
+
+    @classmethod
+    def reset(cls):
+        cls.instances = []
+        cls.from_pretrained_calls = []
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        cls.from_pretrained_calls.append((args, kwargs))
+        pipeline = FakeQwenPipeline()
+        cls.instances.append(pipeline)
+        return pipeline
+
+
 def make_fake_dependencies(available=False, initialized=False):
     return {
         "torch": FakeTorch(available, initialized),
@@ -275,6 +314,8 @@ def make_fake_dependencies(available=False, initialized=False):
         "paint_config": FakePaintConfig,
         "convert": FakeConvert.call,
         "t2i_factory": FakeT2IFactory,
+        "qwen_edit_factory": FakeQwenFactory,
+        "qwen_quantization_factory": lambda **kwargs: kwargs,
     }
 
 
@@ -366,6 +407,39 @@ class WorkerTests(unittest.TestCase):
             WorkerRequest(job_id=uuid.uuid4(), stage="shape", seed=-1, image=SAMPLE_IMAGE_URL, settings=settings)
         with self.assertRaises(Exception):
             WorkerRequest(job_id=uuid.uuid4(), stage="shape", seed=2**33, image=SAMPLE_IMAGE_URL, settings=settings)
+
+    def test_qwen_input_flattens_rgba_sprite_to_rgb(self):
+        engine = self.make_engine(make_fake_dependencies())
+        result = engine._qwen_rgb_image(FakeImage(1024, 1024, "PNG", "RGBA"))
+        self.assertEqual(result.mode, "RGB")
+        self.assertEqual(result.size, (1024, 1024))
+
+    def test_qwen_edit_flattens_rgba_and_uses_4bit_loading(self):
+        qwen_path = self.root / "qwen-edit-model"
+        qwen_path.mkdir(exist_ok=True)
+        FakeQwenFactory.reset()
+        with unittest.mock.patch.dict(os.environ, {
+            "HUNYFORGE_QWEN_EDIT_ENABLED": "1",
+            "HUNYFORGE_QWEN_EDIT_MODEL_PATH": str(qwen_path),
+            "HUNYFORGE_QWEN_EDIT_QUANTIZATION": "4bit",
+        }):
+            engine = self.make_engine(make_fake_dependencies())
+            png, records = engine.generate_qwen_edit(QwenEditRequest(
+                image=SAMPLE_IMAGE_URL, prompt="north-east view", seed=3, width=512, height=512,
+                num_inference_steps=10,
+            ))
+        self.assertEqual(png, b"fakepng")
+        self.assertIn("qwen_model_loading", records)
+        self.assertIn("qwen_edit_inference", records)
+        args, options = FakeQwenFactory.from_pretrained_calls[0]
+        self.assertEqual(args, (str(qwen_path),))
+        self.assertEqual(options["quantization_config"]["quant_backend"], "bitsandbytes_4bit")
+        self.assertEqual(options["quantization_config"]["components_to_quantize"], ["transformer"])
+        self.assertEqual(options["device_map"], "balanced")
+        self.assertEqual(options["max_memory"], {0: "14GiB", "cpu": "20GiB"})
+        self.assertFalse(FakeQwenFactory.instances[0].offloaded)
+        call = FakeQwenFactory.instances[0].calls[0]
+        self.assertEqual(call["image"][0].mode, "RGB")
 
     def test_token_mismatch(self):
         job_id = uuid.uuid4()

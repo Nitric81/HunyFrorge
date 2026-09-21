@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 def run_stage(spec: dict, engine, slot: Path) -> dict:
-    from .hunyuan_worker import PreviewRequest, WorkerRequest
+    from .hunyuan_worker import PreviewRequest, QwenEditRequest, SpriteRequest, WorkerRequest
     kind = spec.get("kind")
     if kind == "generate":
         artifact = engine.generate(WorkerRequest.model_validate(spec["payload"]))
@@ -22,6 +22,18 @@ def run_stage(spec: dict, engine, slot: Path) -> dict:
     if kind == "preview":
         png, records = engine.generate_preview(PreviewRequest.model_validate(spec["payload"]))
         artifact = slot / "preview.png"
+        artifact.write_bytes(png)
+        timings = {name: round(record.get("elapsed_seconds") or 0, 2) for name, record in records.items()}
+        return {"status": "ok", "artifact": str(artifact), "timings": timings}
+    if kind == "sprite":
+        png, records = engine.generate_sprite(SpriteRequest.model_validate(spec["payload"]))
+        artifact = slot / "sprite.png"
+        artifact.write_bytes(png)
+        timings = {name: round(record.get("elapsed_seconds") or 0, 2) for name, record in records.items()}
+        return {"status": "ok", "artifact": str(artifact), "timings": timings}
+    if kind == "qwen-edit":
+        png, records = engine.generate_qwen_edit(QwenEditRequest.model_validate(spec["payload"]))
+        artifact = slot / "qwen-edit.png"
         artifact.write_bytes(png)
         timings = {name: round(record.get("elapsed_seconds") or 0, 2) for name, record in records.items()}
         return {"status": "ok", "artifact": str(artifact), "timings": timings}

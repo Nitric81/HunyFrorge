@@ -10,7 +10,7 @@ from uuid import UUID
 import importlib.util
 
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,11 +24,14 @@ from .models import (
     JobStatus,
     Project,
     ProjectCreate,
+    StageState,
     VehicleRigSpec,
     TERMINAL_STAGES,
     current_model_revision,
     current_runtime_config,
     load_generation_presets,
+    now,
+    qwen_edit_config,
     scaffold_prompt,
     t2i_config,
     T2I_MODEL_ID,
@@ -141,7 +144,7 @@ def _build_health() -> HealthResponse:
     mode = "demo" if os.getenv("HUNYFORGE_DEMO", "1") == "1" else "hunyuan"
     service_ready = hunyuan_service_ready()
     multi_view_enabled = multi_view_service_ready()
-    return HealthResponse(inference_mode=mode, gpu_available=gpu, model_paths_configured=model_configured, model_snapshot_present=snapshot_present, model_snapshot_path=snapshot_root if snapshot_present else None, hunyuan_service_ready=service_ready, runtime_ready=mode == "demo" or (gpu and model_configured and snapshot_present and service_ready), workers=worker_health(), runtime_config=current_runtime_config(), t2i=t2i_config(), multi_view={"enabled": multi_view_enabled or mode == "demo", "adapter_configured": bool(os.getenv("HUNYFORGE_MULTI_VIEW_URL", "").strip()), "reason": None if multi_view_enabled or mode == "demo" else "Start the local Hunyuan3D-2mv worker and set HUNYFORGE_MULTI_VIEW_URL."})
+    return HealthResponse(inference_mode=mode, gpu_available=gpu, model_paths_configured=model_configured, model_snapshot_present=snapshot_present, model_snapshot_path=snapshot_root if snapshot_present else None, hunyuan_service_ready=service_ready, runtime_ready=mode == "demo" or (gpu and model_configured and snapshot_present and service_ready), workers=worker_health(), runtime_config=current_runtime_config(), t2i=t2i_config(), qwen_edit=qwen_edit_config(), multi_view={"enabled": multi_view_enabled or mode == "demo", "adapter_configured": bool(os.getenv("HUNYFORGE_MULTI_VIEW_URL", "").strip()), "reason": None if multi_view_enabled or mode == "demo" else "Start the local Hunyuan3D-2mv worker and set HUNYFORGE_MULTI_VIEW_URL."})
 
 
 @app.get("/", include_in_schema=False)
@@ -170,6 +173,74 @@ class ReferencePreviewRequest(BaseModel):
     scaffold: bool = True
     size: Literal[512, 768, 1024] = 1024
     parent_job_id: UUID | None = None
+
+
+class SpriteCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    prompt: str | None = Field(default=None, max_length=2000)
+    image: str | None = Field(default=None, max_length=14_000_000)
+    seed: int = Field(default=48291, ge=0, le=2**32 - 1)
+    size: Literal[256, 512, 1024, 2048] = 1024
+    width: int | None = Field(default=None, ge=16, le=4096)
+    height: int | None = Field(default=None, ge=16, le=4096)
+    padding_percent: int = Field(default=8, ge=0, le=40)
+    scaffold: bool = True
+
+    @model_validator(mode="after")
+    def require_source(self):
+        if bool(self.prompt and self.prompt.strip()) == bool(self.image):
+            raise ValueError("Provide exactly one of prompt or image")
+        return self
+
+
+class SpriteJobCreateRequest(SpriteCreateRequest):
+    project_id: UUID | None = None
+
+
+class QwenEditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    image: str = Field(min_length=1, max_length=14_000_000)
+    prompt: str = Field(min_length=1, max_length=2000)
+    seed: int = Field(default=48291, ge=0, le=2**32 - 1)
+    size: Literal[512, 768, 1024] = 1024
+    num_inference_steps: int = Field(default=40, ge=10, le=80)
+
+
+class SpriteSheetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    frames: list[str] = Field(min_length=1, max_length=64)
+    frame_width: int = Field(ge=16, le=4096)
+    frame_height: int = Field(ge=16, le=4096)
+    columns: int = Field(ge=1, le=16)
+    directions: int = Field(default=1, ge=1, le=8)
+    animation: str = Field(default="idle", min_length=1, max_length=64)
+
+
+VEHICLE_DIRECTIONS = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+
+
+class VehicleStateFrames(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    state: Literal["intact", "damaged", "wrecked", "empty", "loaded"]
+    frames: list[str] = Field(min_length=8, max_length=8)
+
+
+class VehicleSpriteSetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    states: list[VehicleStateFrames] = Field(min_length=3, max_length=5)
+    frame_width: int = Field(ge=16, le=4096)
+    frame_height: int = Field(ge=16, le=4096)
+
+    @model_validator(mode="after")
+    def require_core_states(self):
+        names = [entry.state for entry in self.states]
+        if len(set(names)) != len(names):
+            raise ValueError("Each vehicle state may appear only once")
+        required = {"intact", "damaged", "wrecked"}
+        missing = required.difference(names)
+        if missing:
+            raise ValueError(f"Missing required vehicle states: {', '.join(sorted(missing))}")
+        return self
 
 
 class RetextureRequest(BaseModel):
@@ -201,6 +272,38 @@ def _worker_preview(payload: dict) -> dict:
         raise HTTPException(status_code=503, detail="Worker is unavailable or still loading; wait for runtime readiness and retry.") from error
 
 
+def _worker_sprite(payload: dict) -> dict:
+    request = urllib.request.Request(_worker_url() + "/sprite", data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=int(os.getenv("HUNYFORGE_T2I_TIMEOUT_SECONDS", "300"))) as response:
+            return json.loads(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as error:
+        detail_body = error.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(detail_body).get("detail") or detail_body
+        except json.JSONDecodeError:
+            detail = detail_body
+        raise HTTPException(status_code=error.code if 400 <= error.code < 600 else 502, detail=f"Worker sprite processing failed: {detail}") from error
+    except urllib.error.URLError as error:
+        raise HTTPException(status_code=503, detail="Worker is unavailable or still loading; wait for runtime readiness and retry.") from error
+
+
+def _worker_qwen_edit(payload: dict) -> dict:
+    request = urllib.request.Request(_worker_url() + "/qwen-edit", data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=int(os.getenv("HUNYFORGE_QWEN_EDIT_TIMEOUT_SECONDS", "1800"))) as response:
+            return json.loads(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as error:
+        detail_body = error.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(detail_body).get("detail") or detail_body
+        except json.JSONDecodeError:
+            detail = detail_body
+        raise HTTPException(status_code=error.code if 400 <= error.code < 600 else 502, detail=f"Qwen edit worker failed: {detail}") from error
+    except urllib.error.URLError as error:
+        raise HTTPException(status_code=503, detail="Qwen edit worker is unavailable or still loading") from error
+
+
 def _demo_preview_image(request: ReferencePreviewRequest) -> str:
     try:
         import base64
@@ -214,6 +317,25 @@ def _demo_preview_image(request: ReferencePreviewRequest) -> str:
     draw = ImageDraw.Draw(image)
     draw.rectangle((request.size // 4, request.size // 4, request.size * 3 // 4, request.size * 3 // 4), fill=tuple(rng.randint(20, 120) for _ in range(3)))
     draw.text((20, 20), f"demo preview: {request.prompt[:60]}", fill=(255, 255, 255))
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _demo_sprite_image(request: SpriteCreateRequest) -> str:
+    try:
+        import base64
+        import random
+        from io import BytesIO
+        from PIL import Image, ImageDraw
+    except ImportError:
+        raise HTTPException(status_code=503, detail="Demo sprite generation requires Pillow")
+    rng = random.Random(request.seed)
+    width, height = request.width or request.size, request.height or request.size
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    inset = round(min(width, height) * (0.16 + request.padding_percent / 250))
+    draw.ellipse((inset, inset, width - inset, height - inset), fill=tuple(rng.randint(30, 200) for _ in range(3)) + (255,))
     buffer = BytesIO()
     image.save(buffer, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
@@ -237,6 +359,155 @@ async def reference_preview(request: ReferencePreviewRequest):
         payload["image"] = request.image.split(",", 1)[1] if request.image.startswith("data:") and "," in request.image else request.image
     result = await asyncio.to_thread(_worker_preview, payload)
     return {"image": result["image"], "timings": result.get("timings", {}), "prompt_effective": prompt, "seed": request.seed}
+
+
+@app.post("/api/sprites")
+async def create_sprite(request: SpriteCreateRequest):
+    width, height = request.width or request.size, request.height or request.size
+    if os.getenv("HUNYFORGE_DEMO", "1") == "1":
+        return {"image": _demo_sprite_image(request), "timings": {"sprite": 0.0}, "seed": request.seed, "size": request.size, "width": width, "height": height, "has_alpha": True, "prompt_effective": request.prompt}
+    source = request.image
+    prompt_effective = None
+    if request.prompt:
+        if not t2i_config()["enabled"]:
+            raise HTTPException(status_code=503, detail="Text-to-sprite requires the local FLUX T2I worker")
+        prompt_effective = scaffold_prompt(request.prompt) if request.scaffold else request.prompt
+        preview = await asyncio.to_thread(_worker_preview, {"prompt": prompt_effective, "seed": request.seed, "width": 1024, "height": 1024})
+        source = preview["image"]
+    if not source:
+        raise HTTPException(status_code=422, detail="Sprite source image is missing")
+    result = await asyncio.to_thread(_worker_sprite, {"image": source, "width": width, "height": height, "padding_percent": request.padding_percent})
+    return {"image": result["image"], "timings": result.get("timings", {}), "seed": request.seed, "size": request.size, "width": width, "height": height, "has_alpha": True, "prompt_effective": prompt_effective}
+
+
+async def _run_sprite_job(job: JobStatus, request: SpriteCreateRequest) -> None:
+    record = job.stage_status.setdefault("shape", StageState())
+    started = now()
+    record.state = "running"
+    record.started_at = started
+    job.stage = JobStage.GENERATING_SHAPE
+    job.progress = 15
+    job.current_operation = "sprite_source"
+    store.save(job)
+    try:
+        result = await create_sprite(request)
+        job.progress = 82
+        job.current_operation = "sprite_packaging"
+        store.save(job)
+        image = result["image"]
+        raw = image.split(",", 1)[1] if image.startswith("data:") and "," in image else image
+        import base64
+        store.add_artifact(job, "sprite.png", base64.b64decode(raw, validate=True))
+        metadata = {key: value for key, value in result.items() if key != "image"}
+        store.add_artifact(job, "sprite-metadata.json", json.dumps(metadata, indent=2).encode("utf-8"))
+        record.state = "complete"
+        record.finished_at = now()
+        record.elapsed_seconds = (record.finished_at - started).total_seconds()
+        for stage in ("texture", "rig", "unity", "validation"):
+            skipped = job.stage_status.setdefault(stage, StageState())
+            skipped.state = "skipped"
+            skipped.finished_at = record.finished_at
+        job.stage = JobStage.COMPLETE
+        job.progress = 100
+        job.current_operation = None
+        job.finished_at = record.finished_at
+        store.save(job)
+    except Exception as error:
+        record.state = "failed"
+        record.finished_at = now()
+        record.elapsed_seconds = (record.finished_at - started).total_seconds()
+        record.error = str(error)
+        job.stage = JobStage.FAILED
+        job.error_code = "SPRITE_ERROR"
+        job.error_message = str(error)
+        job.current_operation = None
+        job.finished_at = record.finished_at
+        store.save(job)
+
+
+@app.post("/api/sprite-jobs", response_model=JobStatus, status_code=202, response_model_exclude=PUBLIC_JOB_EXCLUDE)
+async def create_sprite_job(request: SpriteJobCreateRequest) -> JobStatus:
+    if request.project_id and not store.get_project(request.project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    payload = request.model_dump(mode="json", exclude={"project_id"})
+    job = JobStatus(project_id=request.project_id, backend="sprite", seed=request.seed, texture=False, preset="draft", input_mode="sprite", prompt=request.prompt, t2i_seed=request.seed if request.prompt else None, t2i_model=T2I_MODEL_ID if request.prompt else None, parameters={"sprite": payload}, model_revision=current_model_revision(), runtime_config=current_runtime_config())
+    store.save(job)
+    asyncio.create_task(_run_sprite_job(job, request))
+    return _fresh(job)
+
+
+@app.post("/api/qwen-edit")
+async def qwen_edit_image(request: QwenEditRequest):
+    if not qwen_edit_config()["enabled"]:
+        raise HTTPException(status_code=503, detail="Qwen image editing is disabled on this runtime")
+    result = await asyncio.to_thread(_worker_qwen_edit, {"image": request.image, "prompt": request.prompt, "seed": request.seed, "width": request.size, "height": request.size, "num_inference_steps": request.num_inference_steps})
+    return {"image": result["image"], "timings": result.get("timings", {}), "seed": request.seed, "model": qwen_edit_config()["model"]}
+
+
+@app.post("/api/sprite-sheets")
+async def create_sprite_sheet(request: SpriteSheetRequest):
+    try:
+        import base64
+        from io import BytesIO
+        from PIL import Image
+    except ImportError:
+        raise HTTPException(status_code=503, detail="Sprite sheet assembly requires Pillow")
+    if request.directions > request.columns:
+        raise HTTPException(status_code=422, detail="Columns must accommodate the requested directional frames")
+    rows = (len(request.frames) + request.columns - 1) // request.columns
+    atlas = Image.new("RGBA", (request.columns * request.frame_width, rows * request.frame_height), (0, 0, 0, 0))
+    for index, source in enumerate(request.frames):
+        if not source.startswith("data:image/") or "," not in source:
+            raise HTTPException(status_code=422, detail=f"Frame {index + 1} must be a PNG or JPEG data URL")
+        try:
+            frame = Image.open(BytesIO(base64.b64decode(source.split(",", 1)[1], validate=True))).convert("RGBA")
+        except Exception as error:
+            raise HTTPException(status_code=422, detail=f"Frame {index + 1} is not a readable image: {error}") from error
+        frame.thumbnail((request.frame_width, request.frame_height))
+        x = (index % request.columns) * request.frame_width + (request.frame_width - frame.width) // 2
+        y = (index // request.columns) * request.frame_height + (request.frame_height - frame.height) // 2
+        atlas.alpha_composite(frame, (x, y))
+    output = BytesIO()
+    atlas.save(output, format="PNG")
+    encoded = "data:image/png;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+    return {"image": encoded, "has_alpha": True, "frame_count": len(request.frames), "columns": request.columns, "rows": rows, "frame_width": request.frame_width, "frame_height": request.frame_height, "unity": {"sprite_mode": "Multiple", "pixels_per_unit": request.frame_height, "directions": request.directions, "animation": request.animation}}
+
+
+@app.post("/api/vehicle-sprite-sets")
+async def create_vehicle_sprite_set(request: VehicleSpriteSetRequest):
+    try:
+        import base64
+        from io import BytesIO
+        from PIL import Image
+    except ImportError:
+        raise HTTPException(status_code=503, detail="Vehicle sprite packing requires Pillow")
+
+    def decode_frame(source: str, state: str, direction: str):
+        if not source.startswith("data:image/") or "," not in source:
+            raise HTTPException(status_code=422, detail=f"{state}/{direction} must be a PNG or JPEG data URL")
+        try:
+            return Image.open(BytesIO(base64.b64decode(source.split(",", 1)[1], validate=True))).convert("RGBA")
+        except Exception as error:
+            raise HTTPException(status_code=422, detail=f"{state}/{direction} is not a readable image: {error}") from error
+
+    atlas = Image.new("RGBA", (8 * request.frame_width, len(request.states) * request.frame_height), (0, 0, 0, 0))
+    row_images: dict[str, str] = {}
+    mappings: list[dict] = []
+    for row, entry in enumerate(request.states):
+        row_image = Image.new("RGBA", (8 * request.frame_width, request.frame_height), (0, 0, 0, 0))
+        for column, (direction, source) in enumerate(zip(VEHICLE_DIRECTIONS, entry.frames)):
+            frame = decode_frame(source, entry.state, direction)
+            frame.thumbnail((request.frame_width, request.frame_height))
+            x = column * request.frame_width + (request.frame_width - frame.width) // 2
+            y = (request.frame_height - frame.height) // 2
+            row_image.alpha_composite(frame, (x, y))
+            mappings.append({"state": entry.state, "direction": direction, "rect": {"x": column * request.frame_width, "y": row * request.frame_height, "width": request.frame_width, "height": request.frame_height}})
+        atlas.alpha_composite(row_image, (0, row * request.frame_height))
+        row_bytes = BytesIO(); row_image.save(row_bytes, format="PNG")
+        row_images[entry.state] = "data:image/png;base64," + base64.b64encode(row_bytes.getvalue()).decode("ascii")
+    output = BytesIO(); atlas.save(output, format="PNG")
+    unity = {"sprite_mode": "Multiple", "pixels_per_unit": request.frame_height, "pivot": "Bottom", "directions": list(VEHICLE_DIRECTIONS), "states": [entry.state for entry in request.states], "sprites": mappings}
+    return {"image": "data:image/png;base64," + base64.b64encode(output.getvalue()).decode("ascii"), "rows": row_images, "has_alpha": True, "columns": 8, "row_count": len(request.states), "frame_width": request.frame_width, "frame_height": request.frame_height, "unity": unity}
 
 
 @app.post("/api/jobs", response_model=JobStatus, status_code=202, response_model_exclude=PUBLIC_JOB_EXCLUDE)

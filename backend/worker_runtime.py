@@ -103,6 +103,7 @@ class RuntimeEngine:
         self.paint_pipeline = None
         self.remover = None
         self.t2i_pipeline = None
+        self.qwen_edit_pipeline = None
         self.states = {"shape": "unloaded", "texture": "unloaded", "reference": "unloaded"}
         self.error = None
         self.active_job_id = None
@@ -131,11 +132,20 @@ class RuntimeEngine:
             "torch": torch,
             "Image": Image,
             "t2i_factory": None,
+            "qwen_edit_factory": None,
+            "qwen_quantization_factory": None,
         }
         if os.getenv("HUNYFORGE_T2I_ENABLED", "0") == "1":
             try:
                 from diffusers import Flux2KleinPipeline
                 deps["t2i_factory"] = Flux2KleinPipeline
+            except ImportError:
+                pass
+        if os.getenv("HUNYFORGE_QWEN_EDIT_ENABLED", "0") == "1":
+            try:
+                from diffusers import PipelineQuantizationConfig, QwenImageEditPlusPipeline
+                deps["qwen_edit_factory"] = QwenImageEditPlusPipeline
+                deps["qwen_quantization_factory"] = PipelineQuantizationConfig
             except ImportError:
                 pass
         return deps
@@ -261,6 +271,15 @@ class RuntimeEngine:
         except Exception as e:
             raise ValueError(f"Image convert failed: {e}") from e
 
+    def _qwen_rgb_image(self, image):
+        """Flatten an RGBA sprite before passing it to Qwen's RGB vision encoder."""
+        if image.mode != "RGBA":
+            return image.convert("RGB")
+        Image = self._get_dep("Image")
+        backdrop = Image.new("RGB", image.size, (242, 244, 243))
+        backdrop.paste(image, mask=image.getchannel("A"))
+        return backdrop
+
     def _load_job(self, request):
         job_dir = self.root / "jobs" / str(request.job_id)
         if not job_dir.exists():
@@ -336,6 +355,7 @@ class RuntimeEngine:
         self.paint_pipeline = None
         self.remover = None
         self.t2i_pipeline = None
+        self.qwen_edit_pipeline = None
         gc.collect()
         try:
             torch = self._get_dep("torch")
@@ -560,6 +580,53 @@ class RuntimeEngine:
             return "Flux2KleinPipeline is unavailable in this runtime"
         return None
 
+    def _qwen_edit_ready(self) -> str | None:
+        if os.getenv("HUNYFORGE_QWEN_EDIT_ENABLED", "0") != "1":
+            return "Qwen image editing is disabled (HUNYFORGE_QWEN_EDIT_ENABLED)"
+        model_path = os.environ.get("HUNYFORGE_QWEN_EDIT_MODEL_PATH", "")
+        if not model_path or not Path(model_path).is_dir():
+            return "Qwen edit model path is not configured or missing"
+        try:
+            factory = self._get_dep("qwen_edit_factory")
+        except RuntimeError as e:
+            return str(e)
+        if factory is None:
+            return "QwenImageEditPlusPipeline is unavailable in this runtime"
+        return None
+
+    def _qwen_load_options(self, torch) -> dict:
+        """Return memory-safe loading options for the local 20B Qwen edit model."""
+        mode = os.getenv("HUNYFORGE_QWEN_EDIT_QUANTIZATION", "4bit").strip().lower()
+        if mode in {"", "none", "off"}:
+            return {}
+        if mode != "4bit":
+            raise ValueError("HUNYFORGE_QWEN_EDIT_QUANTIZATION must be '4bit' or 'none'")
+        factory = self._get_dep("qwen_quantization_factory")
+        if factory is None:
+            raise RuntimeError("Qwen 4-bit quantization is unavailable; install bitsandbytes in the worker image")
+        gpu_memory = os.getenv("HUNYFORGE_QWEN_EDIT_GPU_MEMORY", "14GiB")
+        return {
+            "quantization_config": factory(
+                quant_backend="bitsandbytes_4bit",
+                quant_kwargs={
+                    "load_in_4bit": True,
+                    "bnb_4bit_quant_type": "nf4",
+                    "bnb_4bit_compute_dtype": torch.bfloat16,
+                },
+                # Qwen's Qwen2.5-VL text/vision encoder is moved by
+                # Accelerate during image conditioning. bitsandbytes 4-bit
+                # parameters cannot make that meta-tensor transition, so only
+                # quantize the much larger diffusion transformer.
+                components_to_quantize=["transformer"],
+            ),
+            # Sequential CPU offload tries to move bitsandbytes' 4-bit
+            # quantization state from a meta tensor and fails. Diffusers'
+            # balanced map loads each component directly onto its final CPU or
+            # GPU device instead, keeping the 16 GB GPU below its limit.
+            "device_map": "balanced",
+            "max_memory": {0: gpu_memory, "cpu": "20GiB"},
+        }
+
     def generate_preview(self, request) -> tuple[bytes, dict]:
         self.error = None
         t2i_error = self._t2i_ready()
@@ -607,6 +674,93 @@ class RuntimeEngine:
                     with meter.measure("model_release"):
                         self._release_models()
                     self.states["reference"] = "failed" if stage_failed else "unloaded"
+        return buffer.getvalue(), dict(meter.records)
+
+    def generate_qwen_edit(self, request) -> tuple[bytes, dict]:
+        """Reference-guided Qwen edit with sequential offload for low-VRAM hosts."""
+        self.error = None
+        error = self._qwen_edit_ready()
+        if error:
+            self.error = error
+            raise ValueError(error)
+        # Qwen's vision encoder accepts RGB only. Sprite masters are commonly
+        # transparent RGBA PNGs, so flatten alpha onto a neutral canvas before
+        # passing the reference into the model.
+        image = self._qwen_rgb_image(self._load_image(self._decode_base64(request.image)))
+        telemetry_dir = self.root / "telemetry" / "qwen-edits"
+        telemetry_dir.mkdir(parents=True, exist_ok=True)
+        with StageTelemetry(telemetry_dir / f"{uuid4().hex}.json", gpu=True) as meter:
+            try:
+                self.states["reference"] = "loading"
+                torch = self._get_dep("torch")
+                with torch.inference_mode():
+                    with meter.measure("qwen_model_loading"):
+                        self.qwen_edit_pipeline = self._get_dep("qwen_edit_factory").from_pretrained(
+                            os.environ["HUNYFORGE_QWEN_EDIT_MODEL_PATH"],
+                            torch_dtype=torch.bfloat16,
+                            low_cpu_mem_usage=True,
+                            **self._qwen_load_options(torch),
+                        )
+                        if os.getenv("HUNYFORGE_QWEN_EDIT_QUANTIZATION", "4bit").strip().lower() in {"", "none", "off"}:
+                            self.qwen_edit_pipeline.enable_sequential_cpu_offload()
+                        self.states["reference"] = "running"
+                    with meter.measure("qwen_edit_inference"):
+                        result = self.qwen_edit_pipeline(
+                            image=[image], prompt=request.prompt, width=request.width, height=request.height,
+                            num_inference_steps=request.num_inference_steps, true_cfg_scale=4.0,
+                            guidance_scale=1.0, negative_prompt=" ",
+                            generator=torch.Generator(device="cuda").manual_seed(request.seed),
+                            num_images_per_prompt=1,
+                        )
+                buffer = BytesIO()
+                result.images[0].save(buffer, format="PNG")
+            except Exception as e:
+                self.states["reference"] = "failed"
+                self.error = str(e)
+                raise
+            finally:
+                failed = self.states["reference"] == "failed"
+                self.states["reference"] = "unloading"
+                self._release_models()
+                self.states["reference"] = "failed" if failed else "unloaded"
+        return buffer.getvalue(), dict(meter.records)
+
+    def generate_sprite(self, request) -> tuple[bytes, dict]:
+        """Remove the background and normalize an image into a Unity-ready RGBA sprite."""
+        self.error = None
+        image = self._load_image(self._decode_base64(request.image))
+        telemetry_dir = self.root / "telemetry" / "sprites"
+        telemetry_dir.mkdir(parents=True, exist_ok=True)
+        telemetry_path = telemetry_dir / f"{uuid4().hex}.json"
+        with StageTelemetry(telemetry_path, gpu=True) as meter:
+            try:
+                self.states["reference"] = "running"
+                with meter.measure("background_removal"):
+                    self.remover = self._get_dep("remover_factory")()
+                    result = self.remover(image).convert("RGBA")
+                alpha = result.getchannel("A")
+                bounds = alpha.getbbox()
+                if bounds is None:
+                    raise ValueError("Background removal produced an empty sprite")
+                left, top, right, bottom = bounds
+                subject = result.crop((left, top, right, bottom))
+                padding = max(1, round(max(subject.width, subject.height) * request.padding_percent / 100))
+                canvas_size = max(subject.width, subject.height) + padding * 2
+                canvas = self._get_dep("Image").new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+                canvas.alpha_composite(subject, ((canvas_size - subject.width) // 2, (canvas_size - subject.height) // 2))
+                canvas = canvas.resize((request.width, request.height))
+                buffer = BytesIO()
+                canvas.save(buffer, format="PNG")
+                meter.update("sprite", {"width": request.width, "height": request.height, "padding_percent": request.padding_percent, "has_alpha": True})
+            except Exception as e:
+                self.states["reference"] = "failed"
+                self.error = str(e)
+                raise
+            finally:
+                failed = self.states["reference"] == "failed"
+                self.states["reference"] = "unloading"
+                self._release_models()
+                self.states["reference"] = "failed" if failed else "unloaded"
         return buffer.getvalue(), dict(meter.records)
 
     def generate(self, request) -> Path:

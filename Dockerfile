@@ -24,6 +24,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HUNYFORGE_T2I_MODEL_PATH=/models/FLUX.2-klein-4B \
     HUNYFORGE_T2I_ENABLED=1 \
     HUNYFORGE_T2I_MAX_PROMPT_CHARS=2000 \
+    HUNYFORGE_QWEN_EDIT_MODEL_PATH=/models/Qwen-Image-Edit-2511 \
+    HUNYFORGE_QWEN_EDIT_ENABLED=1 \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
@@ -78,19 +80,18 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth \
       -O /opt/hunyuan/hy3dpaint/ckpt/RealESRGAN_x4plus.pth
 
-# Upgrade diffusers/transformers for FLUX.2-klein-4B (Flux2KleinPipeline needs
-# diffusers >=0.37; its Qwen3 text encoder needs transformers >=4.51). Kept as
-# a separate layer after the CUDA extension builds so those stay cached.
-# hub must stay <1.0 for transformers 4.51; safetensors >=0.8 and tokenizers
-# 0.21.x are required by the new packages. deepspeed is unused at inference
-# and its tp_collectives custom op fails to import on torch 2.5.1; removing
-# it also lets transformers 4.51+ skip its eager import.
+# Upgrade Diffusers/Transformers for FLUX.2-klein-4B and Qwen Image Edit.
+# Qwen-Image-Edit-2511's Qwen2.5-VL text configuration requires a newer
+# Transformers parser than 4.51.3. Keep this layer after CUDA builds so the
+# expensive extensions remain cached. deepspeed is unused at inference and
+# its custom op fails to import on torch 2.5.1.
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3.10 -m pip uninstall -y deepspeed && \
     python3.10 -m pip install \
-      "diffusers==0.38.0" "transformers==4.51.3" \
+      "diffusers==0.39.0" "transformers==4.57.6" \
       "huggingface-hub==0.36.2" "safetensors==0.8.0" \
-      "tokenizers==0.21.4" "accelerate==1.10.1"
+      "tokenizers==0.22.1" "accelerate==1.10.1" "bitsandbytes==0.49.1"
+ENV HUNYFORGE_QWEN_EDIT_QUANTIZATION=4bit
 COPY docker/hunyuan-local-models.patch /tmp/hunyuan-local-models.patch
 RUN cd /opt/hunyuan && patch -p1 < /tmp/hunyuan-local-models.patch
 COPY docker/configure_runtime.py /tmp/configure_runtime.py
